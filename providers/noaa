@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# NOAA / weather.gov provider.
+#
+#   providers/noaa <lat> <lon> <label>
+#
+# Prints one normalized "page" object on stdout:
+#   { label, text, icon, state, tooltip, rows: [...] }
+#
+# This is the provider seam: any script that takes <lat> <lon> <label> and
+# prints this shape can be dropped in beside this one and selected with
+# WEATHER_PROVIDER. Nothing NOAA-specific leaks past this file.
+#
+# NOAA requires no API key. It does require a User-Agent that identifies the
+# caller, and it serves the United States only.
+
+set -uo pipefail
+
+lat="${1:?lat required}"; lon="${2:?lon required}"
+alias_label="${3:-}"      # user-supplied alias, wins outright
+fallback_label="${4:-}"   # geocoder's label, last resort
+
+CACHE_DIR="${WEATHER_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-noaa-weather}"
+# NOAA asks callers to identify themselves and to include a contact. Users are
+# urged in the README to set WEATHER_USER_AGENT to something with their own
+# address in it; this default at least carries the plugin name and version so a
+# NOAA operator can tell what is calling and which release.
+UA="${WEATHER_USER_AGENT:-omarchy-noaa-weather/0.1.0 (+https://github.com/Josh-Gotro/omarchy-noaa-weather)}"
+TIMEOUT="${WEATHER_TIMEOUT:-10}"
+UNITS="${WEATHER_UNITS:-f}"
+DAYS="${WEATHER_DAYS:-5}"
+
+# NOAA's /points endpoint accepts at most 4 decimal places and answers a 301
+# redirect to the rounded form for anything longer. Nominatim returns 7, so
+# without this every city-name lookup would bounce off a redirect. Rounding
+# here also keeps the cache key stable for coordinates that differ only in
+# noise digits. 4 decimals is ~11 m, far finer than a 2.5 km forecast grid.
+# LC_ALL=C is load-bearing: printf's %f honours LC_NUMERIC, so under a
+# comma-decimal locale (de_DE, fr_FR, pt_BR...) this emits "30,2711" and builds
+# https://api.weather.gov/points/30,2711,-97,7437 -- a malformed URL that fails
+# for every one of those users and for nobody testing in en_US.
+lat=$(LC_ALL=C printf '%.4f' "$lat")
+lon=$(LC_ALL=C printf '%.4f' "$lon")
+
+# 0700: the geocode and geolocation caches record where this user has been
+# looking, which is nobody else's business on a shared machine.
+mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR" 2>/dev/null
+
+# Writing straight to the cache path truncates it first, so an interrupted run
+# (a shell restart mid-fetch) leaves a half-written file that then poisons every
+# read until its TTL expires. Write beside it and rename, which is atomic within
+# a filesystem.
+cache_put() {
+  local dest="$1" tmp="$1.$$.tmp"
+  if cat > "$tmp"; then mv -f "$tmp" "$dest"; else rm -f "$tmp"; return 1; fi
+}
+
+# A cache entry is usable only if it still parses. A truncated one is deleted
+# and treated as absent rather than trusted.
+cache_get() {
+  local src="$1" max_age="${2:-}"
+  [[ -s $src ]] || return 1
+  if [[ -n $max_age ]] && (( $(date +%s) - $(stat -c %Y "$src" 2>/dev/null || echo 0) >= max_age )); then
+    return 1
+  fi
+  jq -e . "$src" >/dev/null 2>&1 || { rm -f "$src"; return 1; }
+  cat "$src"
+}
+
+get() { curl -fsS --connect-timeout 4 --max-time "$TIMEOUT" -H "User-Agent: $UA" "$@"; }
+
+# curl -f collapses every HTTP >= 400 into exit 22, which would make "this spot
+# is outside the United States" (404) indistinguishable from "you are being
+# rate limited" (429) or "NOAA is having a bad day" (5xx). Those need different
+# messages, so read the status code explicitly.
+#   exit 22 -> outside NOAA coverage      exit 29 -> rate limited / temporarily down
+#   exit 21 -> other HTTP error           exit 7  -> could not connect
+get_checked() {
+  local url="$1" body code
+  body=$(curl -sSL --connect-timeout 4 --max-time "$TIMEOUT" -H "User-Agent: $UA" \
+               -w '\n%{http_code}' "$url" 2>/dev/null) || return 7
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  case "$code" in
+    2*)      printf '%s' "$body"; return 0 ;;
+    404)     return 22 ;;
+    429|5*)  return 29 ;;
+    *)       return 21 ;;
+  esac
+}
+
+# /points is a stable lat,lon -> grid mapping. NOAA asks that it be cached
+# rather than re-fetched on every poll, so it is, for a week.
+pkey=$(printf '%s,%s' "$lat" "$lon" | md5sum | cut -d' ' -f1)
+pcache="$CACHE_DIR/points-$pkey.json"
+jq -e '.properties.forecast' "$pcache" >/dev/null 2>&1 || rm -f "$pcache"
+
+if [[ ! -s $pcache ]] || [[ -n $(find "$pcache" -mtime +7 2>/dev/null) ]]; then
+  if points=$(get_checked "https://api.weather.gov/points/$lat,$lon"); then
+    printf '%s' "$points" | cache_put "$pcache"
+  else
+    rc=$?
+    # A stale cache still beats no forecast at all, so only fail outright when
+    # there is nothing on disk to fall back to.
+    [[ -s $pcache ]] || exit $rc
+  fi
+fi
+
+forecast_url=$(jq -r '.properties.forecast // empty' "$pcache" 2>/dev/null)
+stations_url=$(jq -r '.properties.observationStations // empty' "$pcache" 2>/dev/null)
+[[ -n $forecast_url ]] || exit 22   # no gridpoint here: outside NOAA's coverage
+
+# NOAA's nearest named place ("Austin, TX") reads far better than a geocoder's
+# ("Austin, Travis County, United States"), so it wins unless the user named
+# the location themselves.
+noaa_label=$(jq -r '[.properties.relativeLocation.properties.city,
+                     .properties.relativeLocation.properties.state]
+                    | map(select(. != null)) | join(", ")' "$pcache" 2>/dev/null)
+label="${alias_label:-${noaa_label:-$fallback_label}}"
+
+# Short-lived forecast cache. NOAA publishes hourly, so re-reading a response
+# from the last few minutes costs nothing in freshness -- and it is what keeps
+# a burst of polls (editing several locations in a row, each of which triggers
+# a refetch of every location) from tripping NOAA's rate limiter.
+FORECAST_TTL="${WEATHER_FORECAST_TTL:-300}"
+fkey=$(printf '%s' "$forecast_url" | md5sum | cut -d' ' -f1)
+fcache="$CACHE_DIR/forecast-$fkey.json"
+if ! forecast=$(cache_get "$fcache" "$FORECAST_TTL"); then
+  if forecast=$(get_checked "$forecast_url"); then
+    printf '%s' "$forecast" | cache_put "$fcache"
+  else
+    rc=$?
+    # A slightly stale forecast beats an error for a blip -- but only if that
+    # stale copy still parses.
+    forecast=$(cache_get "$fcache") || exit $rc
+  fi
+fi
+
+# Current conditions come from the nearest station that is actually reporting;
+# the closest one is sometimes stale or missing a temperature.
+skey=$(printf '%s' "$stations_url" | md5sum | cut -d' ' -f1)
+scache="$CACHE_DIR/stations-$skey.json"
+cache_get "$scache" >/dev/null || get "$stations_url" 2>/dev/null | cache_put "$scache"
+current='null'
+ocache="$CACHE_DIR/obs-$skey.json"
+if obs_cached=$(cache_get "$ocache" "$FORECAST_TTL"); then
+  current="$obs_cached"
+elif [[ -s $scache ]]; then
+  for st in $(jq -r '.features[0:3][].properties.stationIdentifier' "$scache" 2>/dev/null); do
+    obs=$(get "https://api.weather.gov/stations/$st/observations/latest" 2>/dev/null) || continue
+    [[ $(jq -r '.properties.temperature.value // "null"' <<<"$obs") != "null" ]] || continue
+    current="$obs"; printf '%s' "$obs" | cache_put "$ocache"; break
+  done
+  # Fall back to a stale observation rather than dropping the "Now" row.
+  if [[ $current == "null" ]]; then current=$(cache_get "$ocache") || current='null'; fi
+fi
+
+jq -n \
+  --argjson forecast "$forecast" \
+  --argjson current "$current" \
+  --arg label "$label" \
+  --arg units "$UNITS" \
+  --argjson days "$DAYS" \
+  -f "$(dirname "$(readlink -f "$0")")/../weather.jq"

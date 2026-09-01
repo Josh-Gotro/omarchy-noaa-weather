@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Entry point: resolve each location, fetch its weather, print the contract.
+#
+#   ./weather-fetch "Austin, TX" 78701 "Juneau, AK"
+#
+# Each argument is a ZIP, a city name, or a literal "lat,lon". The first is the
+# primary: its temperature is what the bar shows. The rest are reachable in the
+# popup with the left/right arrows.
+#
+# Env:
+#   WEATHER_UNITS=f|c        default f
+#   WEATHER_DAYS=N           forecast days, default 5
+#   WEATHER_PROVIDER=noaa    which providers/<name> script to use
+#   WEATHER_USER_AGENT=...   sent to NOAA and Nominatim; set a contact address
+#   WEATHER_TIMEOUT=10       per-request seconds
+#   WEATHER_CACHE_DIR=...    default ~/.cache/omarchy-noaa-weather
+#   WEATHER_AUTOLOCATE=0     never IP-geolocate; show a setup prompt instead
+#   WEATHER_BUDGET=45        overall seconds before remaining locations are skipped
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CACHE_DIR="${WEATHER_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-noaa-weather}"
+
+# Cache entries are per-location and never expire on their own, so a machine
+# that has looked up many places accumulates files forever. Drop anything
+# untouched for a month; a live location rewrites its entries every poll.
+[[ -d $CACHE_DIR ]] && find "$CACHE_DIR" -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null
+PROVIDER="${WEATHER_PROVIDER:-noaa}"
+provider_bin="$HERE/providers/$PROVIDER"
+
+emit_setup() {   # a valid contract that explains itself, never a bare failure
+  # $3 is the bar label; it should describe THIS problem, not assume the
+  # commonest one.
+  jq -nc --arg msg "$1" --arg detail "$2" --arg bar "${3:-set location}" '{
+    text: $bar, icon: "", state: "warn",
+    tooltip: ("Weather: " + $msg),
+    rows: [ { label: $msg, value: "", detail: $detail, state: "warn" } ]
+  }'
+}
+
+if [[ ! -x $provider_bin ]]; then
+  emit_setup "Unknown provider: $PROVIDER" "No executable at providers/$PROVIDER" "bad provider"
+  exit 0
+fi
+
+# A fresh install should show something useful rather than a nag, so fall back
+# to IP geolocation the way Omarchy's built-in weather widget does. This runs
+# only while no location is configured.
+AUTO=0
+if (( $# == 0 )); then
+  if [[ ${WEATHER_AUTOLOCATE:-1} == 0 ]]; then
+    emit_setup "No location set" \
+      "Automatic location is disabled (WEATHER_AUTOLOCATE=0). Add one with the cog, or: omarchy bar set gotro.noaa-weather locations \"Austin, TX\""
+    exit 0
+  fi
+  if auto=$("$HERE/geolocate" 2>/dev/null) && [[ -n $auto ]]; then
+    read -r _alat _alon _alabel <<<"$auto"
+    set -- "$_alat,$_alon|$_alabel"
+    AUTO=1
+  else
+    emit_setup "No location set, and your location could not be detected" \
+      "Set one with: omarchy bar set gotro.noaa-weather locations \"Austin, TX\". Or use the cog in this popup."
+    exit 0
+  fi
+fi
+
+# One page per location, in the order given. A location that fails becomes an
+# error page in its own slot rather than being dropped or appended at the end --
+# otherwise the popup silently reorders itself whenever a city has a bad poll.
+errpage() {
+  jq -nc --arg label "$1" --arg msg "$2" '{
+    label: $label, text: "!", icon: "", state: "error",
+    tooltip: ($label + ": " + $msg),
+    rows: [ { label: "Unavailable", value: "", detail: $msg, state: "error" } ]
+  }'
+}
+
+reason() {
+  case "$1" in
+    22) echo "outside NOAA coverage (weather.gov serves the United States only)" ;;
+    29) echo "NOAA is rate limiting or temporarily unavailable, retrying next poll" ;;
+    21) echo "NOAA returned an unexpected error" ;;
+    6)  echo "could not resolve api.weather.gov" ;;
+    7)  echo "could not reach api.weather.gov" ;;
+    28) echo "timed out reaching api.weather.gov" ;;
+    *)  echo "forecast unavailable (exit $1)" ;;
+  esac
+}
+
+# Per-request timeouts do not bound the whole run: five locations x up to five
+# requests each x a 12s timeout is several minutes of a process the bar cannot
+# cancel, while further polls queue up behind it. Past the budget the remaining
+# locations get an explanatory page instead of an unbounded wait.
+BUDGET="${WEATHER_BUDGET:-45}"
+
+pages=()
+ok_count=0
+
+for loc in "$@"; do
+  [[ -n ${loc// /} ]] || continue
+
+  if (( SECONDS >= BUDGET )); then
+    pages+=("$(errpage "${loc%%|*}" "the ${BUDGET}s budget for this refresh was used up before reaching it")")
+    continue
+  fi
+
+  # "78701|Home" renames a location in the popup without changing the lookup.
+  query="${loc%%|*}"
+  alias=""
+  [[ $loc == *"|"* ]] && alias="${loc#*|}"
+  query="${query#"${query%%[![:space:]]*}"}"; query="${query%"${query##*[![:space:]]}"}"
+
+  if ! resolved=$("$HERE/geocode" "$query" 2>/dev/null); then
+    pages+=("$(errpage "${alias:-$query}" "could not resolve that place name or ZIP")")
+    continue
+  fi
+  read -r lat lon label <<<"$resolved"
+  [[ -n $label ]] || label="$query"
+
+  if page=$("$provider_bin" "$lat" "$lon" "$alias" "$label" 2>/dev/null); then
+    if [[ -n $page ]]; then
+      # Keep the original query on the page: two different points can share
+      # NOAA's nearest-place name, and that is the only way to tell them apart.
+      page=$(jq -c --arg src "$loc" '. + {source: $src}' <<<"$page" 2>/dev/null || printf '%s' "$page")
+      pages+=("$page"); ok_count=$((ok_count + 1))
+    else
+      pages+=("$(errpage "${alias:-$label}" "provider returned nothing")")
+    fi
+  else
+    pages+=("$(errpage "${alias:-$label}" "$(reason $?)")")
+  fi
+done
+
+if (( ${#pages[@]} == 0 )); then
+  emit_setup "No usable location" "Every configured location was blank."
+  exit 0
+fi
+
+# The first page drives the bar. When it failed but another succeeded, promote
+# the first working one so the bar shows real weather instead of "!".
+printf '%s\n' "${pages[@]}" | jq -sc --argjson ok "$ok_count" --argjson auto "$AUTO" '
+  # NOAA names a point by its nearest place, so "99801" and "Juneau downtown"
+  # both come back as "Juneau, AK" -- two identical chips for two real,
+  # different locations. Qualify any label that is not unique with whatever the
+  # user typed, which is the one thing that does distinguish them.
+  ( [.[] | .label] | group_by(.) | map(select(length > 1) | .[0]) ) as $dupes
+  | [ .[] | if (.label as $l | $dupes | index($l)) and ((.source // "") != "")
+             then .label = (.label + " (" + .source + ")")
+             else . end ]
+  | . as $pages
+  | (if $ok > 0 then ([$pages[] | select(.state != "error")] | .[0]) else $pages[0] end) as $primary
+  | ([$pages[] | select(.state == "error")] | length) as $failed
+  | {
+      text:  (if $ok > 0 then $primary.text else "unavailable" end),
+      icon:  ($primary.icon // ""),
+      state: (if $ok == 0 then "error" elif $failed > 0 then "warn" else $primary.state end),
+      tooltip: ($primary.tooltip
+                + (if $failed > 0 then " · " + ($failed|tostring) + " location(s) unavailable" else "" end)),
+      rows:  $primary.rows,
+      pages: $pages,
+      auto:  ($auto == 1)
+    }'

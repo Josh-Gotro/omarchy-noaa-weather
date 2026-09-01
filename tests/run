@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Regression tests. No framework, no network: the jq tests run against frozen
+# NOAA fixtures, and the orchestrator tests use lat,lon locations (which skip
+# geocoding entirely) plus a stub provider.
+#
+#   ./tests/run           all
+#   ./tests/run -v        show each assertion
+
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ROOT="$(dirname "$HERE")"
+FIX="$HERE/fixtures"
+VERBOSE=0; [[ ${1:-} == -v ]] && VERBOSE=1
+
+pass=0; fail=0
+ok()   { pass=$((pass+1)); (( VERBOSE )) && echo "  ok   $1"; return 0; }
+bad()  { fail=$((fail+1)); echo "  FAIL $1"; echo "       expected: $2"; echo "       actual:   $3"; }
+is()   { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "$3" "$2"; }
+has()  { [[ "$2" == *"$3"* ]] && ok "$1" || bad "$1" "contains '$3'" "$2"; }
+
+# Isolate the cache so a developer's real cache cannot affect results.
+export WEATHER_CACHE_DIR; WEATHER_CACHE_DIR=$(mktemp -d)
+# The stub is linked into providers/ so the plugin's own lookup finds it. A
+# leftover symlink would make `omarchy plugin validate` (and therefore
+# `omarchy plugin add`) reject the whole plugin, so clear it on any exit.
+cleanup() { rm -rf "$WEATHER_CACHE_DIR"; rm -f "$ROOT/providers/stub-provider"; }
+trap cleanup EXIT INT TERM
+
+shape() {  # weather.jq against the frozen fixtures
+  jq -n --argjson forecast "$(cat "$FIX/forecast-austin.json")" \
+        --argjson current "${2:-$(cat "$FIX/observation-austin.json")}" \
+        --arg label "Austin, TX" --arg units "${1:-f}" --argjson days "${3:-5}" \
+        -f "$ROOT/weather.jq"
+}
+
+echo "weather.jq: shaping"
+out=$(shape f)
+is  "label passes through"        "$(jq -r .label <<<"$out")" "Austin, TX"
+is  "bar text is the observation" "$(jq -r .text  <<<"$out")" "$(jq -r '(.properties.temperature.value * 9 / 5 + 32) | (.+0.5|floor) | tostring + "°"' "$FIX/observation-austin.json")"
+has "tooltip names the place"     "$(jq -r .tooltip <<<"$out")" "Austin, TX"
+is  "first row is Now"            "$(jq -r '.rows[0].label' <<<"$out")" "Now"
+is  "condition is carried"        "$(jq -r '.condition|type' <<<"$out")" "string"
+is  "icon is set"                 "$(jq -r '.icon|length>0' <<<"$out")" "true"
+
+echo "weather.jq: units"
+f=$(jq -r .text <<<"$(shape f)"); c=$(jq -r .text <<<"$(shape c)")
+[[ "$f" != "$c" ]] && ok "celsius differs from fahrenheit" || bad "celsius differs from fahrenheit" "different" "$f == $c"
+
+echo "weather.jq: day count"
+is "days=3 gives Now + 3 dates" "$(jq '.rows|length' <<<"$(shape f '' 3)")" "4"
+is "days=5 gives Now + 5 dates" "$(jq '.rows|length' <<<"$(shape f '' 5)")" "6"
+
+echo "weather.jq: degraded input"
+noobs=$(shape f null)
+[[ "$(jq -r '.rows[0].label' <<<"$noobs")" != "Now" ]] \
+  && ok "no observation: no Now row" || bad "no observation: no Now row" "not Now" "Now"
+is  "no observation: rows are all forecast days" "$(jq '.rows|length' <<<"$noobs")" "5"
+is  "no observation: still has a bar text" "$(jq -r '.text|length>0' <<<"$noobs")" "true"
+
+echo "weather.jq: condition severity"
+sev() { jq -n --argjson forecast "$(jq --arg s "$1" '.properties.periods |= map(.shortForecast=$s)' "$FIX/forecast-austin.json")" \
+              --argjson current null --arg label L --arg units f --argjson days 2 \
+              -f "$ROOT/weather.jq" | jq -r .state; }
+is "thunderstorms warn"  "$(sev 'Showers And Thunderstorms')" "warn"
+is "tornado is urgent"   "$(sev 'Tornado Warning')"           "error"
+is "sunny is ok"         "$(sev 'Sunny')"                     "ok"
+
+echo "orchestrator: ordering and failures"
+export WEATHER_PROVIDER=stub-provider
+run() { WEATHER_PROVIDER=stub-provider PATH="$PATH" "$ROOT/weather-fetch" "$@"; }
+# providers/ lookup is by name inside the plugin dir, so link the stub in
+ln -sf "$HERE/stub-provider" "$ROOT/providers/stub-provider"
+
+o=$(run "30.1,-97.1|Alpha" "31.2,-98.2|Beta" "32.3,-99.3|Gamma")
+is "page order follows input" "$(jq -r '[.pages[].label]|join(",")' <<<"$o")" "Alpha,Beta,Gamma"
+is "primary drives bar text"  "$(jq -r .text <<<"$o")" "50°"
+
+o=$(run "30.1,-97.1|Alpha" "31.2,-98.2|FAIL22" "32.3,-99.3|Gamma")
+is "failed location keeps its slot" "$(jq -r '.pages[1].state' <<<"$o")" "error"
+is "order still follows input"      "$(jq -r '[.pages[].label]|join(",")' <<<"$o")" "Alpha,FAIL22,Gamma"
+is "partial failure degrades to warn" "$(jq -r .state <<<"$o")" "warn"
+has "coverage message is specific"  "$(jq -r '.pages[1].rows[0].detail' <<<"$o")" "United States"
+
+o=$(run "30.1,-97.1|FAIL22" "31.2,-98.2|Beta")
+is "bar promotes a working page" "$(jq -r .text <<<"$o")" "50°"
+
+o=$(run "30.1,-97.1|FAIL7")
+is "all failed reads unavailable" "$(jq -r .text <<<"$o")" "unavailable"
+is "all failed is an error"       "$(jq -r .state <<<"$o")" "error"
+
+echo "orchestrator: duplicate labels"
+o=$(STUB_LABEL="Juneau, AK" run "58.30,-134.41" "58.36,-134.52")
+is "identical labels are qualified" "$(jq -r '[.pages[].label]|join(" | ")' <<<"$o")" "Juneau, AK (58.30,-134.41) | Juneau, AK (58.36,-134.52)"
+o=$(STUB_LABEL="Juneau, AK" run "58.30,-134.41")
+is "a unique label is left alone"   "$(jq -r '.pages[0].label' <<<"$o")" "Juneau, AK"
+
+echo "orchestrator: time budget"
+o=$(WEATHER_BUDGET=0 run "30.1,-97.1|Alpha" "31.2,-98.2|Beta")
+is "budget exhausted skips locations" "$(jq -r '[.pages[].state]|unique|join(",")' <<<"$o")" "error"
+has "and says why"                    "$(jq -r '.pages[0].rows[0].detail' <<<"$o")" "budget"
+o=$(WEATHER_BUDGET=45 run "30.1,-97.1|Alpha")
+is "a sane budget does not interfere" "$(jq -r .state <<<"$o")" "ok"
+
+echo "orchestrator: setup states"
+noloc=$(WEATHER_AUTOLOCATE=0 run)
+is "no locations is a warn, not a crash" "$(jq -r .state <<<"$noloc")" "warn"
+is "no locations names the problem"      "$(jq -r .text  <<<"$noloc")" "set location"
+has "and says how to fix it"             "$(jq -r '.rows[0].detail' <<<"$noloc")" "omarchy bar set"
+
+echo "Model.js: boolean settings from the CLI"
+# `omarchy bar set` writes strings unless --json is passed, so the widget must
+# accept both shapes or a documented command silently does nothing.
+if command -v node >/dev/null; then
+  ab() { node "$HERE/eval-model.js" "$ROOT/Model.js" asBool "$1" true; }
+  is "real true"        "$(ab 'true')"      "true"
+  is 'string "true"'    "$(ab '"true"')"    "true"
+  is 'string "TRUE"'    "$(ab '"TRUE"')"    "true"
+  is 'string "false"'   "$(ab '"false"')"   "false"
+  is "real false"       "$(ab 'false')"     "false"
+  is "unset falls back" "$(ab 'undefined')" "true"
+else
+  ok "boolean coercion (node unavailable, skipped)"
+fi
+
+echo "geocode: offline forms"
+is "lat,lon needs no service" "$("$ROOT/geocode" "30.27,-97.74")" "30.27 -97.74 30.27,-97.74"
+
+rm -f "$ROOT/providers/stub-provider"
+echo
+echo "$pass passed, $fail failed"
+exit $(( fail > 0 ? 1 : 0 ))

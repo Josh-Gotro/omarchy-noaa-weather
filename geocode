@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Resolve a free-text location to "lat lon label".
+#
+#   ./geocode "78701"          -> 30.2713 -97.7426 Austin, TX
+#   ./geocode "Austin, TX"     -> 30.2672 -97.7431 Austin, Texas, United States
+#   ./geocode "30.27,-97.74"   -> 30.27 -97.74 30.27,-97.74      (no lookup)
+#
+# Results are cached indefinitely: a ZIP or a city name does not move. Delete
+# $CACHE_DIR to force a re-resolve.
+#
+# No API key is required by either service. Nominatim asks for a descriptive
+# User-Agent and at most one request per second; the cache means we are far
+# under that in practice.
+
+set -uo pipefail
+
+CACHE_DIR="${WEATHER_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-noaa-weather}"
+# NOAA asks callers to identify themselves and to include a contact. Users are
+# urged in the README to set WEATHER_USER_AGENT to something with their own
+# address in it; this default at least carries the plugin name and version so a
+# NOAA operator can tell what is calling and which release.
+UA="${WEATHER_USER_AGENT:-omarchy-noaa-weather/0.1.0 (+https://github.com/Josh-Gotro/omarchy-noaa-weather)}"
+TIMEOUT="${WEATHER_TIMEOUT:-10}"
+
+query="${1:-}"
+[[ -n $query ]] || { echo "usage: geocode <zip|city|lat,lon>" >&2; exit 2; }
+
+# A literal "lat,lon" needs no service at all.
+if [[ $query =~ ^[[:space:]]*(-?[0-9]+(\.[0-9]+)?)[[:space:]]*,[[:space:]]*(-?[0-9]+(\.[0-9]+)?)[[:space:]]*$ ]]; then
+  printf '%s %s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "$query"
+  exit 0
+fi
+
+mkdir -p "$CACHE_DIR"
+key=$(printf '%s' "${query,,}" | md5sum | cut -d' ' -f1)
+cache="$CACHE_DIR/geo-$key"
+if [[ -s $cache ]]; then cat "$cache"; exit 0; fi
+
+get() { curl -fsS --connect-timeout 4 --max-time "$TIMEOUT" -H "User-Agent: $UA" "$@"; }
+
+result=""
+if [[ $query =~ ^[[:space:]]*[0-9]{5}[[:space:]]*$ ]]; then
+  # US ZIP: zippopotam is exact and needs no query-string escaping.
+  zip="${query//[[:space:]]/}"
+  result=$(get "https://api.zippopotam.us/us/$zip" 2>/dev/null | jq -r '
+    .places[0] as $p
+    | if $p == null then empty
+      else "\($p.latitude) \($p.longitude) \($p["place name"]), \($p["state abbreviation"])" end')
+else
+  # City / place name.
+  esc=$(jq -rn --arg q "$query" '$q|@uri')
+  result=$(get "https://nominatim.openstreetmap.org/search?q=$esc&format=json&limit=1" 2>/dev/null | jq -r '
+    .[0] as $r
+    | if $r == null then empty
+      else "\($r.lat) \($r.lon) \($r.display_name | split(", ") | if length > 3 then [.[0], .[-3], .[-1]] else . end | join(", "))" end')
+fi
+
+if [[ -z $result ]]; then
+  echo "could not resolve: $query" >&2
+  exit 3
+fi
+
+printf '%s\n' "$result" | tee "$cache"

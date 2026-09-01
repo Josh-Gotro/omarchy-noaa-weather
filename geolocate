@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Best-effort "where am I", for a fresh install with no location configured.
+# Prints "lat lon label" like ./geocode does.
+#
+# Only ever called when the user has configured no locations: once they set
+# one, nothing here runs and no IP is sent anywhere.
+#
+# Cached for 12 hours. Two services are tried, and neither needs a key:
+#   ipapi.co   one call, returns coordinates directly
+#   wttr.in    name only (what Omarchy's built-in weather widget uses), then
+#              handed to ./geocode
+#
+# Note this is IP geolocation: it locates the network, not the device, and on a
+# VPN it will report the exit node. That is why it is only a default -- the
+# user can always set the location explicitly.
+
+set -uo pipefail
+
+CACHE_DIR="${WEATHER_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-noaa-weather}"
+# NOAA asks callers to identify themselves and to include a contact. Users are
+# urged in the README to set WEATHER_USER_AGENT to something with their own
+# address in it; this default at least carries the plugin name and version so a
+# NOAA operator can tell what is calling and which release.
+UA="${WEATHER_USER_AGENT:-omarchy-noaa-weather/0.1.0 (+https://github.com/Josh-Gotro/omarchy-noaa-weather)}"
+TIMEOUT="${WEATHER_TIMEOUT:-10}"
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+mkdir -p "$CACHE_DIR"
+cache="$CACHE_DIR/geolocate"
+if [[ -s $cache && -z $(find "$cache" -mmin +720 2>/dev/null) ]]; then
+  cat "$cache"; exit 0
+fi
+
+get() { curl -fsS --connect-timeout 4 --max-time "$TIMEOUT" -H "User-Agent: $UA" "$@"; }
+
+result=$(get "https://ipapi.co/json/" 2>/dev/null | jq -r '
+  if (.latitude != null and .longitude != null)
+  then "\(.latitude) \(.longitude) \([.city, .region_code // .region] | map(select(. != null and . != "")) | join(", "))"
+  else empty end' 2>/dev/null)
+
+if [[ -z $result ]]; then
+  name=$(get "https://wttr.in/?format=%l" 2>/dev/null | tr -d '\n')
+  [[ -n $name ]] && result=$("$HERE/geocode" "$name" 2>/dev/null)
+fi
+
+[[ -n $result ]] || { echo "could not determine current location" >&2; exit 3; }
+printf '%s\n' "$result" | tee "$cache"

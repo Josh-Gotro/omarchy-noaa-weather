@@ -1,0 +1,7 @@
+# Runtime cache lives in ~/.cache/omarchy-noaa-weather, never in the repo.
+cache/
+*.bak
+*.orig
+*.swp
+.DS_Store
+providers/stub-provider

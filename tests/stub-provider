@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Fake provider for orchestrator tests. Same contract as providers/noaa:
+#   <lat> <lon> [alias] [fallback-label]
+# A fallback label containing FAIL exits with the code after it (FAIL22),
+# so failure handling can be tested without waiting on a real outage.
+set -uo pipefail
+lat="$1"; lon="$2"; alias_label="${3:-}"; fallback="${4:-}"
+# FAIL lands in the alias when written as "lat,lon|FAIL22", so check both.
+for probe in "$alias_label" "$fallback"; do
+  if [[ $probe == FAIL* ]]; then exit "${probe#FAIL}"; fi
+done
+label="${alias_label:-${STUB_LABEL:-$fallback}}"
+jq -nc --arg l "$label" --arg t "${STUB_TEMP:-50°}" '{
+  label: $l, condition: "Clear", text: $t, icon: "S", state: "ok",
+  tooltip: ($l + " · Clear"), rows: [ { label: "Now", value: $t, detail: "Clear", state: "ok" } ]
+}'

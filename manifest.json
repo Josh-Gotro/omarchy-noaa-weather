@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "id": "gotro.noaa-weather",
+  "name": "NOAA Weather",
+  "version": "0.1.0",
+  "author": "Joshua Gauthreaux",
+  "license": "MIT",
+  "description": "Current conditions and a multi-day forecast from NOAA (weather.gov) for one or more US locations, entered as a ZIP, a city name, or lat,lon. No API key required.",
+  "keywords": [
+    "weather",
+    "forecast",
+    "noaa",
+    "weather.gov",
+    "temperature"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "NOAA Weather",
+    "description": "Weather for one or more locations from NOAA. US only; no API key. One widget holds every location, so only one instance is needed.",
+    "category": "Weather",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "locations": "",
+      "units": "f",
+      "days": 5,
+      "showText": true,
+      "refreshIntervalSec": 900,
+      "timeoutSec": 12,
+      "userAgent": "",
+      "title": "Weather",
+      "onClick": "",
+      "provider": ""
+    },
+    "schema": [
+      {
+        "key": "locations",
+        "type": "string",
+        "label": "Locations",
+        "defaultValue": "",
+        "description": "Semicolon-separated (a comma would split \"Austin, TX\" in half). Each entry is a US ZIP (78701), a city (Austin, TX), or lat,lon. Append |Name to rename one, e.g. 78701|Home. The first location is shown in the bar; the rest are reachable in the popup with the arrow keys.",
+        "placeholder": "Austin, TX; 99801|Cabin"
+      },
+      {
+        "key": "units",
+        "type": "string",
+        "label": "Units (f or c)",
+        "defaultValue": "f",
+        "description": "f for Fahrenheit, c for Celsius."
+      },
+      {
+        "key": "days",
+        "type": "integer",
+        "label": "Forecast days",
+        "min": 1,
+        "max": 7,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "NOAA publishes about 7 days."
+      },
+      {
+        "key": "showText",
+        "type": "boolean",
+        "label": "Show temperature next to the icon",
+        "defaultValue": true
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 300,
+        "max": 3600,
+        "step": 60,
+        "defaultValue": 900,
+        "description": "NOAA updates hourly; polling faster only risks rate limiting."
+      },
+      {
+        "key": "timeoutSec",
+        "type": "integer",
+        "label": "Request timeout (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 12
+      },
+      {
+        "key": "userAgent",
+        "type": "string",
+        "label": "User-Agent",
+        "defaultValue": "",
+        "description": "NOAA asks callers to identify themselves. Optional but polite: put a contact address here."
+      },
+      {
+        "key": "title",
+        "type": "string",
+        "label": "Popup heading",
+        "defaultValue": "Weather"
+      },
+      {
+        "key": "onClick",
+        "type": "string",
+        "label": "Middle-click command",
+        "defaultValue": "",
+        "description": "Optional, e.g. xdg-open https://forecast.weather.gov/"
+      },
+      {
+        "key": "provider",
+        "type": "string",
+        "label": "Weather provider",
+        "defaultValue": "",
+        "description": "Filename in providers/. Empty uses the bundled NOAA provider. Any executable taking <lat> <lon> [alias] [fallback-label] and printing a page object works."
+      }
+    ]
+  }
+}
