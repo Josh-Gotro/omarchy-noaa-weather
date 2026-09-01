@@ -58,9 +58,22 @@ wrong model is worse than an honest gap.
 omarchy plugin add https://github.com/Josh-Gotro/omarchy-noaa-weather.git --enable
 ```
 
-**That is the whole install.** With nothing configured it detects your location
-from your IP and shows the weather there, so it is useful before you touch a
-setting.
+**That is the whole install.** With nothing configured the popup shows a short
+setup note: add a location with the cog, or flip on automatic detection there
+if you would rather have it guessed. Detection is **off by default** because
+guessing means sending your IP address to a third party; nothing is contacted
+until you either add a location or opt in.
+
+Manual install, if you prefer:
+
+```bash
+git clone https://github.com/Josh-Gotro/omarchy-noaa-weather.git \
+  ~/.config/omarchy/plugins/gotro.noaa-weather
+omarchy plugin enable gotro.noaa-weather center
+omarchy restart shell
+```
+
+**Requires** `curl` and `jq`, both of which Omarchy already ships.
 
 ## Uninstall
 
@@ -218,30 +231,22 @@ omarchy-shell gotro.noaa-weather move 2 -2        # index, offset
 
 ## Automatic location
 
-With `locations` empty, the plugin asks **ipapi.co** where your IP is (falling
+Off by default, and consent-gated: guessing your location means sending this
+machine's IP address to a third party, and that is not a decision a weather
+widget should make for you. With `locations` empty the popup explains this and
+offers a toggle; nothing is contacted until you flip it.
+
+Turned on (the toggle in the popup's cog view, `autoLocate` in settings, or
+`WEATHER_AUTOLOCATE=1`), the plugin asks **ipapi.co** where your IP is (falling
 back to **wttr.in**, which is what Omarchy's built-in weather widget uses) and
-uses that. The popup says *Location detected automatically* so the guess is
-never mistaken for a setting.
+uses that. The popup then says *Location detected automatically* so the guess
+is never mistaken for a setting.
 
 > [!IMPORTANT]
 > This is IP geolocation: it locates the **network**, not the device, and on a
-> VPN it reports the exit node. It runs **only while no location is configured**
-> Set one and nothing is ever sent to those services again. The result is
-> cached for 12 hours.
->
-> To disable it outright, set `WEATHER_AUTOLOCATE=0`; the widget then asks for a
-> location instead of guessing, and contacts no geolocation service at all.
-
-Manual install, if you prefer:
-
-```bash
-git clone https://github.com/Josh-Gotro/omarchy-noaa-weather.git \
-  ~/.config/omarchy/plugins/gotro.noaa-weather
-omarchy plugin enable gotro.noaa-weather center
-omarchy restart shell
-```
-
-**Requires** `curl` and `jq`, both of which Omarchy already ships.
+> VPN it reports the exit node. It runs **only while no location is
+> configured**. Add one and nothing is ever sent to those services again. The
+> result is cached for 12 hours.
 
 ## Settings
 
@@ -270,7 +275,7 @@ the widget's entry in `~/.config/omarchy/shell.json`.
 | `userAgent` | *(empty)* | See below |
 | `title` | `Weather` | Popup heading, used when a location has no label |
 | `onClick` | *(empty)* | Middle-click command, e.g. `xdg-open https://forecast.weather.gov/` |
-| `provider` | *(empty)* | Filename in `providers/`; empty uses the bundled NOAA one |
+| `autoLocate` | `false` | Allow IP geolocation while no location is set; see [Automatic location](#automatic-location) |
 
 ### User-Agent
 
@@ -360,6 +365,38 @@ Entries untouched for 30 days are pruned on the next run, so a machine that has
 looked up many places does not accumulate files forever. Delete the directory to
 force everything to re-resolve.
 
+### Network and cache policy
+
+Rules the fetch scripts hold themselves to, all implemented in `lib.sh`:
+
+- **https only, to an exact allowlist of hostnames** per script:
+  `api.weather.gov` for the provider, `api.zippopotam.us` and
+  `nominatim.openstreetmap.org` for the geocoder, `ipapi.co` and `wttr.in`
+  for opt-in geolocation. Redirects are followed by hand, one hop at a time,
+  and every hop is re-checked against the same allowlist, so neither a
+  redirect nor a URL embedded in an API response (NOAA's `/points` hands back
+  the forecast URL to call next) can point a request at loopback, a private
+  address, or any other origin.
+- **Every download is capped at 256 KiB while it happens** (`curl
+  --max-filesize`, which aborts mid-transfer), and every cache read is capped
+  the same way. The widget applies the same cap to the process output, and
+  each field of the payload is length-limited on top of that.
+- **The cache is treated as hostile until proven otherwise**: the directory
+  must be a real directory owned by you with mode `0700` under a verified
+  parent, entries must be regular files owned by you with sane modes (no
+  symlinks), writes go through an exclusive `0600` temp file in the same
+  directory and an atomic rename under an advisory lock, and anything that
+  fails a check is discarded, not read.
+- **One hard deadline per refresh**, not just per-request timeouts: the
+  widget launches `weather-fetch` under `timeout`, which runs it in its own
+  process group and signals the whole group, and `weather-fetch` gives each
+  child only what remains of the budget the same way. A hung `curl` three
+  processes down dies with everything else.
+- **Payload strings cannot act or render as markup.** The contract has no
+  field that names a command (the widget's only self-run command is your own
+  `onClick` setting), and every string is control-stripped, angle-bracket
+  stripped, length-capped, and rendered with `Text.PlainText`.
+
 ### Adding another provider
 
 `providers/noaa` is the only file that knows NOAA exists. Any executable that
@@ -371,9 +408,13 @@ takes `<lat> <lon> [alias] [fallback-label]` and prints one page object works:
   "detail": "...", "state": "ok" } ] }
 ```
 
-Drop it in `providers/`, then set `provider` (or `WEATHER_PROVIDER`) to its
-filename. This is how you would add Open-Meteo for worldwide coverage, or a
-keyed service like Windy.
+Drop it in `providers/` and add its name to the fixed allowlist at the top of
+`weather-fetch` (the `case "$PROVIDER"` block), then select it with
+`WEATHER_PROVIDER`. The allowlist is deliberate: which executables may run is
+decided by the code in your plugin folder, never by a value in settings, so a
+writable `shell.json` cannot be parlayed into running an arbitrary path. This
+is how you would add Open-Meteo for worldwide coverage, or a keyed service
+like Windy.
 
 > [!NOTE]
 > A provider needing a **secret** should read it from a file, never from
@@ -393,12 +434,13 @@ WEATHER_PROVIDER=noaa WEATHER_TIMEOUT=20 ./weather-fetch 78701
 | `WEATHER_UNITS` | `f` or `c` |
 | `WEATHER_DAYS` | Calendar days shown, counting today |
 | `WEATHER_TIMEOUT` | Per-request seconds |
-| `WEATHER_PROVIDER` | Which `providers/<name>` to use |
+| `WEATHER_PROVIDER` | Which provider to use, from the fixed allowlist in `weather-fetch` (default `noaa`) |
 | `WEATHER_USER_AGENT` | Sent to NOAA and the geocoders |
 | `WEATHER_CACHE_DIR` | Where the caches live |
 | `WEATHER_FORECAST_TTL` | Forecast cache seconds (default 300) |
-| `WEATHER_AUTOLOCATE=0` | **Never** IP-geolocate; show a setup prompt instead |
-| `WEATHER_BUDGET` | Overall seconds per refresh before remaining locations are skipped (default 45) |
+| `WEATHER_AUTOLOCATE=1` | Allow IP geolocation while no location is configured (off by default) |
+| `WEATHER_BUDGET` | Hard deadline in seconds for a whole refresh (default 45) |
+| `WEATHER_MAX_BYTES` | Cap on any single download or cache read (default 262144) |
 
 ## Failure behaviour
 
@@ -468,6 +510,23 @@ so the order never shuffles between polls.
 - **QML does not hot-reload.** Quickshell runs with `QS_DISABLE_FILE_WATCHER=1`.
   Run `omarchy restart shell` after editing `.qml` or `.js`. Changes to
   `weather-fetch`, `weather.jq`, `geocode` and settings apply on the next poll.
+
+- **URLs inside API responses are still untrusted input.** NOAA's `/points`
+  response names the forecast URL to fetch next; it goes through the same
+  https-and-allowlist gate as a URL we built ourselves, because a response
+  that can name a URL is a response that can name `https://127.0.0.1/`.
+- **`--max-filesize` is enforced mid-transfer by modern curl**, including on
+  chunked responses with no Content-Length (verified: exit 63 at exactly the
+  cap). The size of what landed is still checked afterwards for older curls.
+- **A byte cap after buffering is not a byte cap.** Downloads are limited
+  while downloading, cache reads while reading (`head -c`), and the
+  assembled output is measured before it is printed, with a small error
+  contract emitted instead when it is oversized.
+- **Qt's default `Text` format is `AutoText`**, which sniffs tag-shaped
+  strings as rich text. Every dynamic `Text` here sets `Text.PlainText`, and
+  strings that pass through shared components this plugin does not own (the
+  bar tooltip, the panel hero) additionally have angle brackets stripped in
+  `Model.clip`.
 
 ## Tests
 

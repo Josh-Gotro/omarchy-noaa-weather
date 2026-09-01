@@ -1,33 +1,40 @@
 #!/usr/bin/env bash
 # NOAA / weather.gov provider.
 #
-#   providers/noaa <lat> <lon> <label>
+#   providers/noaa <lat> <lon> [alias] [fallback-label]
 #
 # Prints one normalized "page" object on stdout:
 #   { label, text, icon, state, tooltip, rows: [...] }
 #
-# This is the provider seam: any script that takes <lat> <lon> <label> and
-# prints this shape can be dropped in beside this one and selected with
-# WEATHER_PROVIDER. Nothing NOAA-specific leaks past this file.
+# This is the provider seam: any script that takes these arguments and
+# prints this shape fits behind weather-fetch. Nothing NOAA-specific leaks
+# past this file. Which providers may run at all is a fixed allowlist in
+# weather-fetch, not a setting.
 #
 # NOAA requires no API key. It does require a User-Agent that identifies the
 # caller, and it serves the United States only.
+#
+# Network policy: every request this script makes, including requests to
+# URLs that NOAA's own responses hand back, goes through lib.sh's http_get,
+# which refuses anything that is not https to api.weather.gov exactly.
 
 set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+. "$HERE/../lib.sh"
 
 lat="${1:?lat required}"; lon="${2:?lon required}"
 alias_label="${3:-}"      # user-supplied alias, wins outright
 fallback_label="${4:-}"   # geocoder's label, last resort
 
-CACHE_DIR="${WEATHER_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-noaa-weather}"
-# NOAA asks callers to identify themselves and to include a contact. Users are
-# urged in the README to set WEATHER_USER_AGENT to something with their own
-# address in it; this default at least carries the plugin name and version so a
-# NOAA operator can tell what is calling and which release.
-UA="${WEATHER_USER_AGENT:-omarchy-noaa-weather/0.1.0 (+https://github.com/Josh-Gotro/omarchy-noaa-weather)}"
-TIMEOUT="${WEATHER_TIMEOUT:-10}"
 UNITS="${WEATHER_UNITS:-f}"
 DAYS="${WEATHER_DAYS:-5}"
+
+# Coordinates come from the geocoder, which read them out of a remote
+# response. They must look like coordinates before they are allowed anywhere
+# near a URL.
+[[ $lat =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]] || exit 2
+[[ $lon =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]] || exit 2
 
 # NOAA's /points endpoint accepts at most 4 decimal places and answers a 301
 # redirect to the rounded form for anything longer. Nominatim returns 7, so
@@ -41,80 +48,75 @@ DAYS="${WEATHER_DAYS:-5}"
 lat=$(LC_ALL=C printf '%.4f' "$lat")
 lon=$(LC_ALL=C printf '%.4f' "$lon")
 
-# 0700: the geocode and geolocation caches record where this user has been
-# looking, which is nobody else's business on a shared machine.
-mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR" 2>/dev/null
+# 0700 and verified: the caches record where this user has been looking,
+# which is nobody else's business on a shared machine. If the directory
+# cannot be made safe, run without a cache rather than through an unsafe one.
+CACHE_OK=1
+cache_init || CACHE_OK=0
 
-# Writing straight to the cache path truncates it first, so an interrupted run
-# (a shell restart mid-fetch) leaves a half-written file that then poisons every
-# read until its TTL expires. Write beside it and rename, which is atomic within
-# a filesystem.
-cache_put() {
-  local dest="$1" tmp="$1.$$.tmp"
-  if cat > "$tmp"; then mv -f "$tmp" "$dest"; else rm -f "$tmp"; return 1; fi
-}
-
-# A cache entry is usable only if it still parses. A truncated one is deleted
-# and treated as absent rather than trusted.
-cache_get() {
-  local src="$1" max_age="${2:-}"
-  [[ -s $src ]] || return 1
-  if [[ -n $max_age ]] && (( $(date +%s) - $(stat -c %Y "$src" 2>/dev/null || echo 0) >= max_age )); then
-    return 1
+# fetch_api URL: body on stdout, bounded and host-checked by http_get.
+#   exit 22 -> outside NOAA coverage      exit 29 -> rate limited / NOAA down
+#   exit 21 -> other HTTP error or non-JSON body
+#   exit 6/7/28 -> resolve / connect / timeout
+#   exit 60/63/65 -> URL refused / body too large / redirect refused
+fetch_api() {
+  local url="$1" body_file code rc
+  body_file=$(mktemp "${TMPDIR:-/tmp}/noaa-body.XXXXXX") || return 21
+  code=$(http_get "$url" "$body_file" api.weather.gov)
+  rc=$?
+  if (( rc != 0 )); then
+    rm -f "$body_file"
+    return $rc
   fi
-  jq -e . "$src" >/dev/null 2>&1 || { rm -f "$src"; return 1; }
-  cat "$src"
-}
-
-get() { curl -fsS --connect-timeout 4 --max-time "$TIMEOUT" -H "User-Agent: $UA" "$@"; }
-
-# curl -f collapses every HTTP >= 400 into exit 22, which would make "this spot
-# is outside the United States" (404) indistinguishable from "you are being
-# rate limited" (429) or "NOAA is having a bad day" (5xx). Those need different
-# messages, so read the status code explicitly.
-#   exit 22 -> outside NOAA coverage      exit 29 -> rate limited / temporarily down
-#   exit 21 -> other HTTP error           exit 7  -> could not connect
-get_checked() {
-  local url="$1" body code
-  body=$(curl -sSL --connect-timeout 4 --max-time "$TIMEOUT" -H "User-Agent: $UA" \
-               -w '\n%{http_code}' "$url" 2>/dev/null) || return 7
-  code="${body##*$'\n'}"
-  body="${body%$'\n'*}"
   case "$code" in
-    2*)      printf '%s' "$body"; return 0 ;;
-    404)     return 22 ;;
-    429|5*)  return 29 ;;
-    *)       return 21 ;;
+    2*)     ;;
+    404)    rm -f "$body_file"; return 22 ;;
+    429|5*) rm -f "$body_file"; return 29 ;;
+    *)      rm -f "$body_file"; return 21 ;;
   esac
+  jq -e . "$body_file" >/dev/null 2>&1 || { rm -f "$body_file"; return 21; }
+  cat "$body_file"
+  rm -f "$body_file"
 }
+
+ck_get() { (( CACHE_OK )) && cache_get "$@"; }
+ck_put() { if (( CACHE_OK )); then cache_put "$@"; else cat >/dev/null; fi; }
 
 # /points is a stable lat,lon -> grid mapping. NOAA asks that it be cached
 # rather than re-fetched on every poll, so it is, for a week.
 pkey=$(printf '%s,%s' "$lat" "$lon" | md5sum | cut -d' ' -f1)
 pcache="$CACHE_DIR/points-$pkey.json"
-jq -e '.properties.forecast' "$pcache" >/dev/null 2>&1 || rm -f "$pcache"
-
-if [[ ! -s $pcache ]] || [[ -n $(find "$pcache" -mtime +7 2>/dev/null) ]]; then
-  if points=$(get_checked "https://api.weather.gov/points/$lat,$lon"); then
-    printf '%s' "$points" | cache_put "$pcache"
+points=""
+if points=$(ck_get "$pcache" 604800) && jq -e '.properties.forecast' <<<"$points" >/dev/null 2>&1; then
+  :
+else
+  if points=$(fetch_api "https://api.weather.gov/points/$lat,$lon"); then
+    printf '%s' "$points" | ck_put "$pcache"
   else
     rc=$?
-    # A stale cache still beats no forecast at all, so only fail outright when
-    # there is nothing on disk to fall back to.
-    [[ -s $pcache ]] || exit $rc
+    # A stale mapping still beats no forecast at all, so only fail outright
+    # when there is nothing safe on disk to fall back to.
+    points=$(ck_get "$pcache") || exit $rc
   fi
 fi
 
-forecast_url=$(jq -r '.properties.forecast // empty' "$pcache" 2>/dev/null)
-stations_url=$(jq -r '.properties.observationStations // empty' "$pcache" 2>/dev/null)
+# These URLs arrived inside a NOAA response. They are revalidated by
+# http_get before any request goes out, so a tampered or spoofed response
+# cannot point the next fetch at another origin; the explicit check here
+# just fails faster and clearer.
+forecast_url=$(jq -r '.properties.forecast // empty' <<<"$points")
+stations_url=$(jq -r '.properties.observationStations // empty' <<<"$points")
 [[ -n $forecast_url ]] || exit 22   # no gridpoint here: outside NOAA's coverage
+url_allowed "$forecast_url" api.weather.gov || exit 60
+[[ -z $stations_url ]] || url_allowed "$stations_url" api.weather.gov || stations_url=""
 
 # NOAA's nearest named place ("Austin, TX") reads far better than a geocoder's
 # ("Austin, Travis County, United States"), so it wins unless the user named
-# the location themselves.
+# the location themselves. It is remote text, so it is sanitized like all of it.
 noaa_label=$(jq -r '[.properties.relativeLocation.properties.city,
                      .properties.relativeLocation.properties.state]
-                    | map(select(. != null)) | join(", ")' "$pcache" 2>/dev/null)
+                    | map(select(. != null)) | join(", ")' <<<"$points" 2>/dev/null)
+noaa_label=$(sanitize_line "$noaa_label" 80)
 label="${alias_label:-${noaa_label:-$fallback_label}}"
 
 # Short-lived forecast cache. NOAA publishes hourly, so re-reading a response
@@ -124,34 +126,43 @@ label="${alias_label:-${noaa_label:-$fallback_label}}"
 FORECAST_TTL="${WEATHER_FORECAST_TTL:-300}"
 fkey=$(printf '%s' "$forecast_url" | md5sum | cut -d' ' -f1)
 fcache="$CACHE_DIR/forecast-$fkey.json"
-if ! forecast=$(cache_get "$fcache" "$FORECAST_TTL"); then
-  if forecast=$(get_checked "$forecast_url"); then
-    printf '%s' "$forecast" | cache_put "$fcache"
+if ! forecast=$(ck_get "$fcache" "$FORECAST_TTL"); then
+  if forecast=$(fetch_api "$forecast_url"); then
+    printf '%s' "$forecast" | ck_put "$fcache"
   else
     rc=$?
     # A slightly stale forecast beats an error for a blip -- but only if that
-    # stale copy still parses.
-    forecast=$(cache_get "$fcache") || exit $rc
+    # stale copy is safe to read and still parses.
+    forecast=$(ck_get "$fcache") || exit $rc
   fi
 fi
 
 # Current conditions come from the nearest station that is actually reporting;
 # the closest one is sometimes stale or missing a temperature.
-skey=$(printf '%s' "$stations_url" | md5sum | cut -d' ' -f1)
-scache="$CACHE_DIR/stations-$skey.json"
-cache_get "$scache" >/dev/null || get "$stations_url" 2>/dev/null | cache_put "$scache"
 current='null'
-ocache="$CACHE_DIR/obs-$skey.json"
-if obs_cached=$(cache_get "$ocache" "$FORECAST_TTL"); then
-  current="$obs_cached"
-elif [[ -s $scache ]]; then
-  for st in $(jq -r '.features[0:3][].properties.stationIdentifier' "$scache" 2>/dev/null); do
-    obs=$(get "https://api.weather.gov/stations/$st/observations/latest" 2>/dev/null) || continue
-    [[ $(jq -r '.properties.temperature.value // "null"' <<<"$obs") != "null" ]] || continue
-    current="$obs"; printf '%s' "$obs" | cache_put "$ocache"; break
-  done
-  # Fall back to a stale observation rather than dropping the "Now" row.
-  if [[ $current == "null" ]]; then current=$(cache_get "$ocache") || current='null'; fi
+if [[ -n $stations_url ]]; then
+  skey=$(printf '%s' "$stations_url" | md5sum | cut -d' ' -f1)
+  scache="$CACHE_DIR/stations-$skey.json"
+  stations=$(ck_get "$scache") \
+    || { stations=$(fetch_api "$stations_url") && printf '%s' "$stations" | ck_put "$scache"; } \
+    || stations=""
+  ocache="$CACHE_DIR/obs-$skey.json"
+  if obs_cached=$(ck_get "$ocache" "$FORECAST_TTL"); then
+    current="$obs_cached"
+  elif [[ -n $stations ]]; then
+    for st in $(jq -r '.features[0:3][].properties.stationIdentifier // empty' <<<"$stations" 2>/dev/null); do
+      # The station id lands in a URL path, so it is held to what station ids
+      # actually look like. Anything else in the response is skipped.
+      [[ $st =~ ^[A-Za-z0-9._-]{1,16}$ ]] || continue
+      obs=$(fetch_api "https://api.weather.gov/stations/$st/observations/latest") || continue
+      [[ $(jq -r '.properties.temperature.value // "null"' <<<"$obs") != "null" ]] || continue
+      current="$obs"
+      printf '%s' "$obs" | ck_put "$ocache"
+      break
+    done
+    # Fall back to a stale observation rather than dropping the "Now" row.
+    if [[ $current == "null" ]]; then current=$(ck_get "$ocache") || current='null'; fi
+  fi
 fi
 
 jq -n \
@@ -160,4 +171,4 @@ jq -n \
   --arg label "$label" \
   --arg units "$UNITS" \
   --argjson days "$DAYS" \
-  -f "$(dirname "$(readlink -f "$0")")/../weather.jq"
+  -f "$HERE/../weather.jq"

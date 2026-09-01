@@ -23,7 +23,7 @@ export WEATHER_CACHE_DIR; WEATHER_CACHE_DIR=$(mktemp -d)
 # The stub is linked into providers/ so the plugin's own lookup finds it. A
 # leftover symlink would make `omarchy plugin validate` (and therefore
 # `omarchy plugin add`) reject the whole plugin, so clear it on any exit.
-cleanup() { rm -rf "$WEATHER_CACHE_DIR"; rm -f "$ROOT/providers/stub-provider"; }
+cleanup() { rm -rf "$WEATHER_CACHE_DIR"; rm -f "$ROOT/providers/test-stub"; }
 trap cleanup EXIT INT TERM
 
 shape() {  # weather.jq against the frozen fixtures
@@ -66,10 +66,11 @@ is "tornado is urgent"   "$(sev 'Tornado Warning')"           "error"
 is "sunny is ok"         "$(sev 'Sunny')"                     "ok"
 
 echo "orchestrator: ordering and failures"
-export WEATHER_PROVIDER=stub-provider
-run() { WEATHER_PROVIDER=stub-provider PATH="$PATH" "$ROOT/weather-fetch" "$@"; }
-# providers/ lookup is by name inside the plugin dir, so link the stub in
-ln -sf "$HERE/stub-provider" "$ROOT/providers/stub-provider"
+export WEATHER_PROVIDER=test-stub
+run() { WEATHER_PROVIDER=test-stub PATH="$PATH" "$ROOT/weather-fetch" "$@"; }
+# providers/ lookup is by allowlisted name inside the plugin dir, so link the
+# stub in under its allowlisted test name
+ln -sf "$HERE/stub-provider" "$ROOT/providers/test-stub"
 
 o=$(run "30.1,-97.1|Alpha" "31.2,-98.2|Beta" "32.3,-99.3|Gamma")
 is "page order follows input" "$(jq -r '[.pages[].label]|join(",")' <<<"$o")" "Alpha,Beta,Gamma"
@@ -122,10 +123,91 @@ else
   ok "boolean coercion (node unavailable, skipped)"
 fi
 
+
+echo "orchestrator: geolocation is opt-in"
+# No locations and no opt-in must produce guidance, never a network request.
+# The detail names what opting in would send and where.
+defloc=$(run)
+is  "unset autolocate does not locate" "$(jq -r .state <<<"$defloc")" "warn"
+has "and explains the trade"           "$(jq -r '.rows[0].detail' <<<"$defloc")" "ipapi.co"
+has "and points at the cog"            "$(jq -r '.rows[0].detail' <<<"$defloc")" "cog"
+
+echo "orchestrator: provider allowlist"
+for bad in "../tests/stub-provider" "/bin/echo" "noaa2" ".." "noaa/../../x"; do
+  o=$(WEATHER_PROVIDER="$bad" "$ROOT/weather-fetch" "30.1,-97.1")
+  is "rejects provider '$bad'" "$(jq -r .text <<<"$o")" "bad provider"
+done
+
+echo "orchestrator: bounded output"
+o=$(STUB_HUGE=1 run "30.1,-97.1|Alpha")
+has "oversized payload is refused, with a reason" "$(jq -r '.rows[0].label' <<<"$o")" "too large"
+is  "and is still a valid contract" "$(jq -e 'has("text") and has("rows")' <<<"$o")" "true"
+
+echo "orchestrator: location cap"
+locs=(); for i in $(seq 1 14); do locs+=("3$i.0,-97.$i|L$i"); done
+o=$(run "${locs[@]}")
+is "more than 12 locations are cut to 12" "$(jq '.pages|length' <<<"$o")" "12"
+
+echo "lib: URL policy"
+allow() { ( . "$ROOT/lib.sh"; url_allowed "$1" api.weather.gov ) && echo yes || echo no; }
+is "weather.gov https"        "$(allow 'https://api.weather.gov/points/1,2')" "yes"
+is "plain http"               "$(allow 'http://api.weather.gov/points/1,2')"  "no"
+is "another host"             "$(allow 'https://evil.example/x')"             "no"
+is "host suffix trick"        "$(allow 'https://api.weather.gov.evil.example/x')" "no"
+is "userinfo trick"           "$(allow 'https://api.weather.gov@evil.example/x')" "no"
+is "loopback"                 "$(allow 'https://127.0.0.1/x')"                "no"
+is "explicit port"            "$(allow 'https://api.weather.gov:8443/x')"     "no"
+is "case-insensitive host"    "$(allow 'https://API.WEATHER.GOV/points/1,2')" "yes"
+
+echo "lib: cache safety"
+cachetest() { ( . "$ROOT/lib.sh"; CACHE_DIR="$WEATHER_CACHE_DIR"; "$@" ); }
+# writes are bounded and private
+head -c 400000 /dev/zero | tr '\0' 'a' | cachetest cache_put "$WEATHER_CACHE_DIR/bigfile"
+sz=$(stat -c %s "$WEATHER_CACHE_DIR/bigfile")
+is "cache_put caps at 256 KiB"   "$sz" "262144"
+is "cache files are private"     "$(stat -c %a "$WEATHER_CACHE_DIR/bigfile")" "600"
+# a symlinked cache entry is refused and cleared, not followed
+secret=$(mktemp); echo '{"leak":true}' > "$secret"
+ln -sf "$secret" "$WEATHER_CACHE_DIR/sneaky.json"
+if cachetest cache_get "$WEATHER_CACHE_DIR/sneaky.json" >/dev/null 2>&1; then
+  bad "cache_get refuses a symlink" "refusal" "followed it"
+else
+  ok "cache_get refuses a symlink"
+fi
+[[ -e "$WEATHER_CACHE_DIR/sneaky.json" || -L "$WEATHER_CACHE_DIR/sneaky.json" ]] \
+  && bad "and removes it" "gone" "still there" || ok "and removes it"
+rm -f "$secret"
+# a group/world-writable entry is refused
+echo '{"ok":true}' | cachetest cache_put "$WEATHER_CACHE_DIR/loose.json"
+chmod 666 "$WEATHER_CACHE_DIR/loose.json"
+if cachetest cache_get "$WEATHER_CACHE_DIR/loose.json" >/dev/null 2>&1; then
+  bad "cache_get refuses loose modes" "refusal" "read it"
+else
+  ok "cache_get refuses loose modes"
+fi
+
+echo "Model.js: payload hygiene"
+if command -v node >/dev/null; then
+  ev() { node "$HERE/eval-model.js" "$ROOT/Model.js" "$@"; }
+  row=$(ev normalizeRow '{"label":"Now","value":"50","action":"rm -rf ~","detail":"x"}')
+  is  "rows carry no action field" "$(jq 'has("action")' <<<"$row")" "false"
+  is  "angle brackets are stripped" "$(ev clip '"<img src=x>"' 64)" " img src=x "
+  cmd=$(ev weatherCommand '{"script":"/x/weather-fetch","locations":"78701","budget":45}')
+  has "fetch runs under a hard deadline" "$cmd" "timeout -k 5 55"
+  [[ "$cmd" == *WEATHER_AUTOLOCATE* ]] \
+    && bad "no autolocate without opt-in" "absent" "present" || ok "no autolocate without opt-in"
+  cmd=$(ev weatherCommand '{"script":"/x/weather-fetch","locations":"78701","autoLocate":true}')
+  has "opt-in passes autolocate through" "$cmd" "WEATHER_AUTOLOCATE=1"
+  pages=$(ev normalize "$(jq -nc '{text:"x", pages:[range(30)|{label:("p"+tostring),text:"1"}]}|tojson')")
+  is  "pages are capped at 12" "$(jq '.pages|length' <<<"$pages")" "12"
+else
+  ok "payload hygiene (node unavailable, skipped)"
+fi
+
 echo "geocode: offline forms"
 is "lat,lon needs no service" "$("$ROOT/geocode" "30.27,-97.74")" "30.27 -97.74 30.27,-97.74"
 
-rm -f "$ROOT/providers/stub-provider"
+rm -f "$ROOT/providers/test-stub"
 echo
 echo "$pass passed, $fail failed"
 exit $(( fail > 0 ? 1 : 0 ))

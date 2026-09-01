@@ -6,11 +6,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The workflow only reads the tree. Nothing here needs write access to
+# anything, so nothing gets it.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to the immutable commit rather than a movable tag, so a
+      # compromised or retargeted tag cannot change what runs here.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Tool versions
         run: |
@@ -20,9 +27,16 @@ jobs:
 
       - name: Shell syntax
         run: |
-          for f in weather-fetch geocode geolocate providers/noaa tests/run tests/stub-provider; do
+          for f in weather-fetch lib.sh geocode geolocate providers/noaa tests/run tests/stub-provider; do
             bash -n "$f" || exit 1
           done
+
+      # weather-fetch resolves providers from a fixed allowlist of names, one
+      # of which (test-stub) may only ever exist while ./tests/run is running.
+      # A tree that ships anything but the bundled provider is wrong.
+      - name: Providers are exactly the bundled set
+        run: |
+          test "$(ls providers)" = "noaa" || { echo "unexpected files in providers/:"; ls providers; exit 1; }
 
       - name: JavaScript syntax
         run: node --check Model.js

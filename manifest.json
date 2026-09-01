@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "gotro.noaa-weather",
   "name": "NOAA Weather",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Joshua Gauthreaux",
   "license": "MIT",
   "description": "Current conditions and a multi-day forecast from NOAA (weather.gov) for one or more US locations, entered as a ZIP, a city name, or lat,lon. No API key required.",
@@ -35,7 +35,7 @@
       "userAgent": "",
       "title": "Weather",
       "onClick": "",
-      "provider": ""
+      "autoLocate": false
     },
     "schema": [
       {
@@ -109,11 +109,11 @@
         "description": "Optional, e.g. xdg-open https://forecast.weather.gov/"
       },
       {
-        "key": "provider",
-        "type": "string",
-        "label": "Weather provider",
-        "defaultValue": "",
-        "description": "Filename in providers/. Empty uses the bundled NOAA provider. Any executable taking <lat> <lon> [alias] [fallback-label] and printing a page object works."
+        "key": "autoLocate",
+        "type": "boolean",
+        "label": "Detect location automatically (sends your IP to ipapi.co)",
+        "defaultValue": false,
+        "description": "Only used while no location is configured. Guessing a location means sending this machine's IP address to a third party (ipapi.co, or wttr.in as fallback), so this is off until you turn it on, here or with the toggle in the popup."
       }
     ]
   }

@@ -19,8 +19,13 @@ import "Model.js" as Model
 //   { "text": "...", "icon": "", "state": "ok|warn|error|offline",
 //     "tooltip": "...",
 //     "rows": [ { "label": "...", "value": "...", "state": "...",
-//                 "detail": "...", "action": "<shell command>" } ],
+//                 "detail": "..." } ],
 //     "pages": [ { "label": "Austin, TX", "condition": "Clear", ...same... } ] }
+//
+// Rows are data, never behaviour: the contract has no field that names a
+// command, and Model.normalize drops one if a response invents it. Every
+// string in the payload is length-capped and control-stripped by Model.clip
+// and rendered with Text.PlainText.
 //
 // A laptop is not always on a network, so "away" is a first-class state rather
 // than an error: a DNS or connect failure dims the pill instead of turning it
@@ -41,7 +46,9 @@ Panel {
   readonly property string unitsSetting: String(setting("units", "f")).trim()
   readonly property string daysSetting: String(setting("days", 5))
   readonly property string userAgentSetting: String(setting("userAgent", "")).trim()
-  readonly property string providerSetting: String(setting("provider", "")).trim()
+  // IP geolocation is consent-gated: it sends this machine's address to a
+  // third party, so it stays off until the user flips it on in the editor.
+  readonly property bool autoLocateSetting: Model.asBool(setting("autoLocate", false), false)
   readonly property int intervalSec: Math.max(5, Number(setting("refreshIntervalSec", 30)) || 30)
   readonly property int timeoutSec: Math.max(1, Number(setting("timeoutSec", 6)) || 6)
   // `omarchy bar set <id> showText true` writes the STRING "true" unless the
@@ -137,6 +144,13 @@ Panel {
                    "locations", editList.join("; ")])
   }
 
+  // The consent switch for IP geolocation. Written with --json so the stored
+  // value is a real boolean, though asBool would forgive the string form too.
+  function setAutoLocate(value) {
+    Util.execArgv(["omarchy", "bar", "set", root.moduleName,
+                   "autoLocate", value ? "true" : "false", "--json"])
+  }
+
   // ---- Pages: one per configured location. A single-location payload has no
   // pages at all and everything below falls back to the top-level fields, so
   // the multi-location case costs the simple case nothing.
@@ -193,7 +207,8 @@ Panel {
       days: root.daysSetting,
       timeout: root.timeoutSec,
       userAgent: root.userAgentSetting,
-      provider: root.providerSetting
+      autoLocate: root.autoLocateSetting,
+      budget: 45
     })
   }
 
@@ -317,12 +332,10 @@ Panel {
     clampCursor()
   }
 
-  function activateRow() {
-    if (rows.length === 0) return
-    var row = rows[Math.max(0, Math.min(rowIndex, rows.length - 1))]
-    runAction(row && row.action ? row.action : "")
-  }
-
+  // The ONLY command this widget ever runs from the popup is the user's own
+  // onClick setting. Rows carry no actions: nothing a provider or a network
+  // response prints can name a command to execute (Model.normalizeRow drops
+  // any such field before it gets here).
   function runAction(command) {
     var text = String(command || "").trim()
     if (text !== "" && bar) bar.run(text)
@@ -407,6 +420,21 @@ Panel {
     onTriggered: root.poll()
   }
 
+  // Last-resort deadline, above the script's own: the command runs under
+  // `timeout -k` (55s hard ceiling), so this should never fire. If it does --
+  // timeout missing, a wedged pipe -- kill the process rather than let every
+  // later poll queue behind it forever.
+  Timer {
+    interval: 70000
+    running: fetchProc.running
+    repeat: false
+    onTriggered: {
+      fetchProc.running = false
+      root.busy = false
+      root.lastError = "fetch exceeded its deadline and was stopped"
+    }
+  }
+
   // Keeps "updated 2m ago" honest while someone is looking at it, and idle
   // when nobody is.
   Timer {
@@ -485,6 +513,7 @@ Panel {
       Text {
         anchors.verticalCenter: parent.verticalCenter
         text: root.glyph
+        textFormat: Text.PlainText
         color: root.stateColor(root.statusKind)
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
@@ -495,6 +524,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         visible: !root.vertical && root.showText && root.barLabel !== ""
         text: root.barLabel
+        textFormat: Text.PlainText
         color: root.stateColor(root.statusKind)
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
@@ -544,7 +574,6 @@ Panel {
         }
         root.moveCursor(dx, dy)
       }
-      onActivateRequested: if (root.cursorActive) root.activateRow()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
@@ -584,6 +613,7 @@ Panel {
             iconComponent: Component {
               Text {
                 text: root.activePage && root.activePage.icon !== "" ? root.activePage.icon : root.glyph
+                textFormat: Text.PlainText
                 color: root.stateColor(root.activePage ? root.activePage.state : root.statusKind)
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
@@ -650,6 +680,7 @@ Panel {
                     anchors.centerIn: parent
                     text: (modelData.label !== "" ? modelData.label : "?")
                           + (modelData.text !== "" ? "  " + modelData.text : "")
+                    textFormat: Text.PlainText
                     color: modelData.state === "error" ? root.urgent
                          : index === root.pageIndex ? root.foreground : root.dim
                     font.family: root.fontFamily
@@ -745,6 +776,7 @@ Panel {
                   anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
                   text: modelData + (index === 0 ? "   · in the bar" : "")
+                  textFormat: Text.PlainText
                   color: index === 0 ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -789,6 +821,55 @@ Panel {
               text: root.autoLocated
                 ? "Using your detected location. Add one below to pin your own."
                 : "No locations yet. Add one below."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            // Consent switch for IP geolocation. It only matters while no
+            // location is configured (a configured location always wins and
+            // nothing is ever sent), so it only shows then -- and it is off
+            // until the user clicks it, because turning it on sends this
+            // machine's IP address to a third party.
+            Item {
+              visible: root.editList.length === 0
+              width: parent.width
+              implicitHeight: autoRow.implicitHeight + Style.space(8)
+
+              Row {
+                id: autoRow
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(10)
+
+                Text {
+                  text: root.autoLocateSetting ? "" : ""
+                  color: root.autoLocateSetting ? root.foreground : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                Text {
+                  text: "Detect my location automatically"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setAutoLocate(!root.autoLocateSetting)
+              }
+            }
+
+            Text {
+              visible: root.editList.length === 0
+              width: parent.width
+              text: "This sends your IP address to ipapi.co to guess a city. It stays off until you turn it on, and stops the moment you add a location."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -901,21 +982,20 @@ Panel {
     property var row: null
     property int position: 0
 
-    readonly property bool clickable: row && String(row.action || "") !== ""
-
     hasCursor: root.cursorActive && root.rowIndex === position
     foreground: root.foreground
     implicitHeight: rowContent.implicitHeight + Style.spacing.rowPaddingX
 
+    // Rows are display only. They deliberately carry no click action: a row's
+    // content comes from the network, and remote content must never choose
+    // what runs on this machine.
     MouseArea {
       anchors.fill: parent
       hoverEnabled: true
-      cursorShape: statusRow.clickable ? Qt.PointingHandCursor : Qt.ArrowCursor
       onEntered: {
         root.cursorActive = true
         root.rowIndex = statusRow.position
       }
-      onClicked: if (statusRow.clickable) root.runAction(statusRow.row.action)
     }
 
     RowLayout {
@@ -934,6 +1014,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           text: statusRow.row ? statusRow.row.label : ""
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -944,6 +1025,7 @@ Panel {
           visible: statusRow.row && statusRow.row.detail !== ""
           Layout.fillWidth: true
           text: statusRow.row ? statusRow.row.detail : ""
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -953,6 +1035,7 @@ Panel {
 
       Text {
         text: statusRow.row ? statusRow.row.value : ""
+        textFormat: Text.PlainText
         color: statusRow.row ? root.stateColor(statusRow.row.state) : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall

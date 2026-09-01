@@ -7,15 +7,37 @@ function shq(value) {
   return "'" + text.replace(/'/g, "'\\''") + "'"
 }
 
+// Everything the fetch reports is remote or user-typed text, and all of it is
+// rendered as plain text. This is the other half of that rule: control
+// characters and angle brackets become spaces (some strings pass through
+// shared components like the bar tooltip, whose Text defaults to AutoText
+// and would sniff anything tag-shaped as rich text) and every field has a
+// hard length cap, so no string from the network can carry markup, terminal
+// escape sequences, or enough bytes to matter.
+function clip(value, max) {
+  var text = String(value === undefined || value === null ? "" : value)
+  text = text.replace(/[\u0000-\u001f\u007f-\u009f<>]/g, " ")
+  if (text.length > max) text = text.slice(0, max)
+  return text
+}
+
 // Builds the weather command from settings, so the only thing a user has to
-// type is the location list. `exec` remains available as a full override.
+// type is the location list.
 //
 // Locations are separated by SEMICOLONS, not commas: "Austin, TX" already
 // contains a comma, and splitting on it would turn one city into two bad
 // lookups.
+//
+// The whole run goes under `timeout`: the script keeps its own internal
+// budget, but a wedged run must die on a deadline rather than sit on the
+// process slot while polls queue behind it. GNU timeout runs the command in
+// its own process group and signals the group, so a hung curl three children
+// down dies with everything else.
 function weatherCommand(opts) {
   var script = String(opts.script === undefined || opts.script === null ? "" : opts.script).trim()
   if (script === "") return ""
+
+  var budget = Number(opts.budget) > 0 ? Math.floor(Number(opts.budget)) : 45
 
   var env = ""
   function put(name, value) {
@@ -26,17 +48,18 @@ function weatherCommand(opts) {
   put("WEATHER_DAYS", opts.days)
   put("WEATHER_TIMEOUT", opts.timeout)
   put("WEATHER_USER_AGENT", opts.userAgent)
-  put("WEATHER_PROVIDER", opts.provider)
+  put("WEATHER_BUDGET", budget)
+  if (opts.autoLocate === true) env += "WEATHER_AUTOLOCATE=1 "
 
   var args = ""
   var raw = opts.locations
   var list = Array.isArray(raw) ? raw : String(raw === undefined || raw === null ? "" : raw).split(";")
   for (var i = 0; i < list.length; i++) {
-    var loc = String(list[i]).trim()
+    var loc = clip(String(list[i]).trim(), 120)
     if (loc !== "") args += " " + shq(loc)
   }
 
-  return env + shq(script) + args
+  return env + "timeout -k 5 " + (budget + 10) + " " + shq(script) + args
 }
 
 // Settings can arrive as real booleans (hand-edited shell.json) or as strings
@@ -58,26 +81,28 @@ function normalizeState(value) {
   if (["warn", "warning", "degraded", "pending", "running", "busy", "partial"].indexOf(text) >= 0) return "warn"
   if (["error", "err", "fail", "failed", "down", "critical", "unhealthy", "false"].indexOf(text) >= 0) return "error"
   if (["offline", "unreachable", "unknown", "idle"].indexOf(text) >= 0) return "offline"
-  return text
+  return clip(text, 16)
 }
 
+// A row carries no command and no action: nothing a provider prints can make
+// the widget run anything. The only command the widget ever runs by itself is
+// the user's own onClick setting.
 function normalizeRow(entry) {
   if (entry === undefined || entry === null) return null
-  if (typeof entry !== "object") return { label: String(entry), value: "", state: "", detail: "", action: "" }
+  if (typeof entry !== "object") return { label: clip(entry, 64), value: "", state: "", detail: "" }
 
   var label = entry.label !== undefined ? entry.label : (entry.name !== undefined ? entry.name : "")
   var value = entry.value !== undefined ? entry.value : (entry.status !== undefined ? entry.status : "")
   return {
-    label: String(label === null ? "" : label),
-    value: String(value === null ? "" : value),
+    label: clip(label, 64),
+    value: clip(value, 32),
     state: normalizeState(entry.state !== undefined ? entry.state : entry.status),
-    detail: String(entry.detail === undefined || entry.detail === null ? "" : entry.detail),
-    action: String(entry.action === undefined || entry.action === null ? "" : entry.action)
+    detail: clip(entry.detail, 200)
   }
 }
 
 // Accepts the contract, a bare array of rows, or plain text. Anything that
-// is not JSON becomes a one-line label, so a gateway that only prints a word
+// is not JSON becomes a one-line label, so a provider that only prints a word
 // still lights up the bar.
 // A page is one location's worth of the same shape, plus a label. Pages let a
 // single widget carry several locations without the QML knowing what a city is.
@@ -85,17 +110,17 @@ function normalizePage(entry) {
   if (!entry || typeof entry !== "object") return null
   var rows = []
   var source = Array.isArray(entry.rows) ? entry.rows : []
-  for (var i = 0; i < source.length && rows.length < 100; i++) {
+  for (var i = 0; i < source.length && rows.length < 40; i++) {
     var row = normalizeRow(source[i])
     if (row && (row.label !== "" || row.value !== "")) rows.push(row)
   }
   return {
-    label: String(entry.label === undefined || entry.label === null ? "" : entry.label),
-    condition: String(entry.condition === undefined || entry.condition === null ? "" : entry.condition),
-    text: String(entry.text === undefined || entry.text === null ? "" : entry.text),
-    icon: String(entry.icon === undefined || entry.icon === null ? "" : entry.icon),
+    label: clip(entry.label, 80),
+    condition: clip(entry.condition, 64),
+    text: clip(entry.text, 32),
+    icon: clip(entry.icon, 8),
     state: normalizeState(entry.state),
-    tooltip: String(entry.tooltip === undefined || entry.tooltip === null ? "" : entry.tooltip),
+    tooltip: clip(entry.tooltip, 300),
     rows: rows
   }
 }
@@ -109,32 +134,32 @@ function normalize(raw) {
   try {
     data = JSON.parse(text)
   } catch (e) {
-    return { text: firstLine(text).slice(0, 120), icon: "", state: "", tooltip: "", rows: [] }
+    return { text: clip(firstLine(text), 120), icon: "", state: "", tooltip: "", rows: [] }
   }
 
-  if (data === null || typeof data !== "object") return { text: String(data), icon: "", state: "", tooltip: "", rows: [] }
+  if (data === null || typeof data !== "object") return { text: clip(data, 120), icon: "", state: "", tooltip: "", rows: [] }
   if (Array.isArray(data)) data = { rows: data }
 
   var source = Array.isArray(data.rows) ? data.rows : []
   var rows = []
-  for (var i = 0; i < source.length && rows.length < 100; i++) {
+  for (var i = 0; i < source.length && rows.length < 40; i++) {
     var row = normalizeRow(source[i])
     if (row && (row.label !== "" || row.value !== "")) rows.push(row)
   }
 
   var pages = []
   if (Array.isArray(data.pages)) {
-    for (var j = 0; j < data.pages.length && pages.length < 24; j++) {
+    for (var j = 0; j < data.pages.length && pages.length < 12; j++) {
       var page = normalizePage(data.pages[j])
       if (page) pages.push(page)
     }
   }
 
   return {
-    text: String(data.text === undefined || data.text === null ? "" : data.text),
-    icon: String(data.icon === undefined || data.icon === null ? "" : data.icon),
+    text: clip(data.text, 32),
+    icon: clip(data.icon, 8),
     state: normalizeState(data.state),
-    tooltip: String(data.tooltip === undefined || data.tooltip === null ? "" : data.tooltip),
+    tooltip: clip(data.tooltip, 300),
     rows: rows,
     pages: pages
   }

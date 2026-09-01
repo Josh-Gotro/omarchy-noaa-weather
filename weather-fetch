@@ -10,24 +10,52 @@
 # Env:
 #   WEATHER_UNITS=f|c        default f
 #   WEATHER_DAYS=N           forecast days, default 5
-#   WEATHER_PROVIDER=noaa    which providers/<name> script to use
 #   WEATHER_USER_AGENT=...   sent to NOAA and Nominatim; set a contact address
 #   WEATHER_TIMEOUT=10       per-request seconds
 #   WEATHER_CACHE_DIR=...    default ~/.cache/omarchy-noaa-weather
-#   WEATHER_AUTOLOCATE=0     never IP-geolocate; show a setup prompt instead
-#   WEATHER_BUDGET=45        overall seconds before remaining locations are skipped
+#   WEATHER_AUTOLOCATE=1     allow IP geolocation when no location is set.
+#                            OFF by default: it sends this machine's address
+#                            to a third party, so it requires opting in.
+#   WEATHER_BUDGET=45        hard deadline in seconds for the whole run
+#   WEATHER_PROVIDER=noaa    which provider to use, from a fixed allowlist
 
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-CACHE_DIR="${WEATHER_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-noaa-weather}"
+. "$HERE/lib.sh"
 
-# Cache entries are per-location and never expire on their own, so a machine
-# that has looked up many places accumulates files forever. Drop anything
-# untouched for a month; a live location rewrites its entries every poll.
-[[ -d $CACHE_DIR ]] && find "$CACHE_DIR" -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null
+# Providers are a fixed allowlist of names, resolved inside this plugin's own
+# providers/ directory -- never a path, and never anything a setting can
+# extend. test-stub exists only while ./tests/run is executing and is not
+# shipped (CI refuses a tree that contains it).
 PROVIDER="${WEATHER_PROVIDER:-noaa}"
-provider_bin="$HERE/providers/$PROVIDER"
+case "$PROVIDER" in
+  noaa|test-stub) provider_bin="$HERE/providers/$PROVIDER" ;;
+  *) provider_bin="" ;;
+esac
+
+# One hard deadline for the whole refresh, not just per-request timeouts:
+# five locations x up to five requests each x a 12s timeout would otherwise
+# be minutes of a process the bar cannot cancel, with further polls queueing
+# behind it. Every child below runs under `timeout` with whatever remains of
+# the budget; timeout puts the child in its own process group and signals the
+# whole group, so a hung curl dies with its parent instead of being orphaned.
+BUDGET="${WEATHER_BUDGET:-45}"
+run_bounded() {
+  local remaining=$(( BUDGET - SECONDS ))
+  (( remaining < 1 )) && remaining=1
+  timeout -k 2 "$remaining" "$@"
+}
+
+# The cache prune below and every cache write in the children go through the
+# verified cache directory; if it cannot be made safe the children run
+# uncached, and nothing here touches it.
+if cache_init; then
+  # Cache entries are per-location and never expire on their own, so a machine
+  # that has looked up many places accumulates files forever. Drop anything
+  # untouched for a month; a live location rewrites its entries every poll.
+  with_cache_lock find "$CACHE_DIR" -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null
+fi
 
 emit_setup() {   # a valid contract that explains itself, never a bare failure
   # $3 is the bar label; it should describe THIS problem, not assume the
@@ -39,22 +67,27 @@ emit_setup() {   # a valid contract that explains itself, never a bare failure
   }'
 }
 
+if [[ -z $provider_bin ]]; then
+  emit_setup "Unknown provider: $(sanitize_line "$PROVIDER" 40)" "WEATHER_PROVIDER must name a bundled provider (noaa)" "bad provider"
+  exit 0
+fi
 if [[ ! -x $provider_bin ]]; then
-  emit_setup "Unknown provider: $PROVIDER" "No executable at providers/$PROVIDER" "bad provider"
+  emit_setup "Provider not runnable: $PROVIDER" "No executable at providers/$PROVIDER" "bad provider"
   exit 0
 fi
 
-# A fresh install should show something useful rather than a nag, so fall back
-# to IP geolocation the way Omarchy's built-in weather widget does. This runs
-# only while no location is configured.
+# With no location configured the widget offers IP geolocation, but never
+# performs it unopposed: locating by IP means sending this machine's address
+# to a third party (ipapi.co, or wttr.in as fallback), so it stays off until
+# the user turns it on in the popup or sets WEATHER_AUTOLOCATE=1 themselves.
 AUTO=0
 if (( $# == 0 )); then
-  if [[ ${WEATHER_AUTOLOCATE:-1} == 0 ]]; then
+  if [[ ${WEATHER_AUTOLOCATE:-0} != 1 ]]; then
     emit_setup "No location set" \
-      "Automatic location is disabled (WEATHER_AUTOLOCATE=0). Add one with the cog, or: omarchy bar set gotro.noaa-weather locations \"Austin, TX\""
+      "Add one with the cog: a ZIP, a city, or lat,lon. Or turn on automatic location there, which sends this machine's IP address to ipapi.co to guess where you are. Terminal: omarchy bar set gotro.noaa-weather locations \"Austin, TX\""
     exit 0
   fi
-  if auto=$("$HERE/geolocate" 2>/dev/null) && [[ -n $auto ]]; then
+  if auto=$(run_bounded "$HERE/geolocate" 2>/dev/null) && [[ -n $auto ]]; then
     read -r _alat _alon _alabel <<<"$auto"
     set -- "$_alat,$_alon|$_alabel"
     AUTO=1
@@ -64,6 +97,10 @@ if (( $# == 0 )); then
     exit 0
   fi
 fi
+
+# More pages than this cannot be navigated usefully in a popup, and each one
+# costs NOAA requests. Everything past the cap is ignored outright.
+if (( $# > 12 )); then set -- "${@:1:12}"; fi
 
 # One page per location, in the order given. A location that fails becomes an
 # error page in its own slot rather than being dropped or appended at the end --
@@ -84,15 +121,13 @@ reason() {
     6)  echo "could not resolve api.weather.gov" ;;
     7)  echo "could not reach api.weather.gov" ;;
     28) echo "timed out reaching api.weather.gov" ;;
+    60) echo "refused a request outside the approved weather.gov endpoints" ;;
+    63) echo "response was larger than the allowed limit" ;;
+    65) echo "refused an off-policy redirect" ;;
+    124|137) echo "ran out of time this refresh, retrying next poll" ;;
     *)  echo "forecast unavailable (exit $1)" ;;
   esac
 }
-
-# Per-request timeouts do not bound the whole run: five locations x up to five
-# requests each x a 12s timeout is several minutes of a process the bar cannot
-# cancel, while further polls queue up behind it. Past the budget the remaining
-# locations get an explanatory page instead of an unbounded wait.
-BUDGET="${WEATHER_BUDGET:-45}"
 
 pages=()
 ok_count=0
@@ -101,7 +136,7 @@ for loc in "$@"; do
   [[ -n ${loc// /} ]] || continue
 
   if (( SECONDS >= BUDGET )); then
-    pages+=("$(errpage "${loc%%|*}" "the ${BUDGET}s budget for this refresh was used up before reaching it")")
+    pages+=("$(errpage "$(sanitize_line "${loc%%|*}" 80)" "the ${BUDGET}s budget for this refresh was used up before reaching it")")
     continue
   fi
 
@@ -111,24 +146,25 @@ for loc in "$@"; do
   [[ $loc == *"|"* ]] && alias="${loc#*|}"
   query="${query#"${query%%[![:space:]]*}"}"; query="${query%"${query##*[![:space:]]}"}"
 
-  if ! resolved=$("$HERE/geocode" "$query" 2>/dev/null); then
-    pages+=("$(errpage "${alias:-$query}" "could not resolve that place name or ZIP")")
+  if ! resolved=$(run_bounded "$HERE/geocode" "$query" 2>/dev/null); then
+    pages+=("$(errpage "$(sanitize_line "${alias:-$query}" 80)" "could not resolve that place name or ZIP")")
     continue
   fi
   read -r lat lon label <<<"$resolved"
   [[ -n $label ]] || label="$query"
 
-  if page=$("$provider_bin" "$lat" "$lon" "$alias" "$label" 2>/dev/null); then
+  if page=$(run_bounded "$provider_bin" "$lat" "$lon" "$alias" "$label" 2>/dev/null); then
     if [[ -n $page ]]; then
       # Keep the original query on the page: two different points can share
       # NOAA's nearest-place name, and that is the only way to tell them apart.
       page=$(jq -c --arg src "$loc" '. + {source: $src}' <<<"$page" 2>/dev/null || printf '%s' "$page")
       pages+=("$page"); ok_count=$((ok_count + 1))
     else
-      pages+=("$(errpage "${alias:-$label}" "provider returned nothing")")
+      pages+=("$(errpage "$(sanitize_line "${alias:-$label}" 80)" "provider returned nothing")")
     fi
   else
-    pages+=("$(errpage "${alias:-$label}" "$(reason $?)")")
+    rc=$?   # before anything else runs and resets it
+    pages+=("$(errpage "$(sanitize_line "${alias:-$label}" 80)" "$(reason $rc)")")
   fi
 done
 
@@ -139,7 +175,7 @@ fi
 
 # The first page drives the bar. When it failed but another succeeded, promote
 # the first working one so the bar shows real weather instead of "!".
-printf '%s\n' "${pages[@]}" | jq -sc --argjson ok "$ok_count" --argjson auto "$AUTO" '
+out=$(printf '%s\n' "${pages[@]}" | jq -sc --argjson ok "$ok_count" --argjson auto "$AUTO" '
   # NOAA names a point by its nearest place, so "99801" and "Juneau downtown"
   # both come back as "Juneau, AK" -- two identical chips for two real,
   # different locations. Qualify any label that is not unique with whatever the
@@ -160,4 +196,13 @@ printf '%s\n' "${pages[@]}" | jq -sc --argjson ok "$ok_count" --argjson auto "$A
       rows:  $primary.rows,
       pages: $pages,
       auto:  ($auto == 1)
-    }'
+    }')
+
+# The widget truncates anything past 256 KiB, and truncated JSON parses as
+# nothing. Providers are bounded, but a bound enforced only by good behaviour
+# is not a bound: past the cap, say so instead of emitting it.
+if (( ${#out} > MAX_BYTES )); then
+  emit_setup "Response too large" "The assembled weather data exceeded the ${MAX_BYTES} byte limit." "error"
+else
+  printf '%s\n' "$out"
+fi

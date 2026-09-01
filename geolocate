@@ -1,47 +1,65 @@
 #!/usr/bin/env bash
-# Best-effort "where am I", for a fresh install with no location configured.
+# Best-effort "where am I", for an install with no location configured.
 # Prints "lat lon label" like ./geocode does.
 #
-# Only ever called when the user has configured no locations: once they set
-# one, nothing here runs and no IP is sent anywhere.
+# This is IP geolocation: it sends this machine's public address to a third
+# party and locates the network, not the device. It therefore NEVER runs by
+# default. weather-fetch calls it only after the user has turned automatic
+# location on (the toggle in the popup, or WEATHER_AUTOLOCATE=1), and stops
+# calling it the moment any location is configured.
 #
 # Cached for 12 hours. Two services are tried, and neither needs a key:
 #   ipapi.co   one call, returns coordinates directly
 #   wttr.in    name only (what Omarchy's built-in weather widget uses), then
 #              handed to ./geocode
-#
-# Note this is IP geolocation: it locates the network, not the device, and on a
-# VPN it will report the exit node. That is why it is only a default -- the
-# user can always set the location explicitly.
 
 set -uo pipefail
 
-CACHE_DIR="${WEATHER_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-noaa-weather}"
-# NOAA asks callers to identify themselves and to include a contact. Users are
-# urged in the README to set WEATHER_USER_AGENT to something with their own
-# address in it; this default at least carries the plugin name and version so a
-# NOAA operator can tell what is calling and which release.
-UA="${WEATHER_USER_AGENT:-omarchy-noaa-weather/0.1.0 (+https://github.com/Josh-Gotro/omarchy-noaa-weather)}"
-TIMEOUT="${WEATHER_TIMEOUT:-10}"
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+. "$HERE/lib.sh"
 
-mkdir -p "$CACHE_DIR"
+CACHE_OK=1
+cache_init || CACHE_OK=0
 cache="$CACHE_DIR/geolocate"
-if [[ -s $cache && -z $(find "$cache" -mmin +720 2>/dev/null) ]]; then
-  cat "$cache"; exit 0
+
+emit_checked() {
+  local line lat lon label
+  line=$(sanitize_line "$1" 200)
+  read -r lat lon label <<<"$line"
+  [[ $lat =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]] || return 1
+  [[ $lon =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]] || return 1
+  printf '%s %s %s\n' "$lat" "$lon" "${label:-}"
+}
+
+if (( CACHE_OK )) && cached=$(cache_get_raw "$cache" 43200) && emit_checked "$cached"; then
+  exit 0
 fi
 
-get() { curl -fsS --connect-timeout 4 --max-time "$TIMEOUT" -H "User-Agent: $UA" "$@"; }
+fetch_text() {  # URL HOST -> bounded body on stdout
+  local url="$1" host="$2" body_file code rc
+  body_file=$(mktemp "${TMPDIR:-/tmp}/geo-body.XXXXXX") || return 1
+  code=$(http_get "$url" "$body_file" "$host")
+  rc=$?
+  if (( rc != 0 )) || [[ $code != 2* ]]; then rm -f "$body_file"; return 1; fi
+  cat "$body_file"
+  rm -f "$body_file"
+}
 
-result=$(get "https://ipapi.co/json/" 2>/dev/null | jq -r '
+result=$(fetch_text "https://ipapi.co/json/" ipapi.co | jq -r '
   if (.latitude != null and .longitude != null)
   then "\(.latitude) \(.longitude) \([.city, .region_code // .region] | map(select(. != null and . != "")) | join(", "))"
   else empty end' 2>/dev/null)
 
 if [[ -z $result ]]; then
-  name=$(get "https://wttr.in/?format=%l" 2>/dev/null | tr -d '\n')
+  name=$(fetch_text "https://wttr.in/?format=%l" wttr.in | tr -d '\n')
+  name=$(sanitize_line "$name" 80)
   [[ -n $name ]] && result=$("$HERE/geocode" "$name" 2>/dev/null)
 fi
 
-[[ -n $result ]] || { echo "could not determine current location" >&2; exit 3; }
-printf '%s\n' "$result" | tee "$cache"
+if [[ -z ${result:-} ]] || ! line=$(emit_checked "$result"); then
+  echo "could not determine current location" >&2
+  exit 3
+fi
+
+if (( CACHE_OK )); then printf '%s\n' "$line" | cache_put "$cache"; fi
+printf '%s\n' "$line"

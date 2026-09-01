@@ -3,6 +3,9 @@
 #   <lat> <lon> [alias] [fallback-label]
 # A fallback label containing FAIL exits with the code after it (FAIL22),
 # so failure handling can be tested without waiting on a real outage.
+# STUB_HUGE=1 emits a deliberately oversized page, for the output-size guard.
+# ./tests/run links this to providers/test-stub for the duration of a run;
+# it is never shipped there, and CI refuses a tree that contains it.
 set -uo pipefail
 lat="$1"; lon="$2"; alias_label="${3:-}"; fallback="${4:-}"
 # FAIL lands in the alias when written as "lat,lon|FAIL22", so check both.
@@ -10,6 +13,13 @@ for probe in "$alias_label" "$fallback"; do
   if [[ $probe == FAIL* ]]; then exit "${probe#FAIL}"; fi
 done
 label="${alias_label:-${STUB_LABEL:-$fallback}}"
+if [[ ${STUB_HUGE:-} == 1 ]]; then
+  jq -nc --arg l "$label" '{
+    label: $l, condition: "Clear", text: "50°", icon: "S", state: "ok",
+    tooltip: ("x" * 400000), rows: []
+  }'
+  exit 0
+fi
 jq -nc --arg l "$label" --arg t "${STUB_TEMP:-50°}" '{
   label: $l, condition: "Clear", text: $t, icon: "S", state: "ok",
   tooltip: ($l + " · Clear"), rows: [ { label: "Now", value: $t, detail: "Clear", state: "ok" } ]
