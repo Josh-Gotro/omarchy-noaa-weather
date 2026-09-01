@@ -505,6 +505,18 @@ of vendoring it, and fixes do not propagate on their own. The poll-coalescing
 fix here, for instance, exists only in this plugin. Worth knowing before
 copying this as a starting point for another widget.
 
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+how to run the tests, what to check before opening a pull request, and the
+handful of things in this codebase that are easy to get wrong.
+
+Security problems should go through
+[a private advisory](https://github.com/Josh-Gotro/omarchy-noaa-weather/security/advisories/new)
+rather than a public issue. [SECURITY.md](SECURITY.md) also documents exactly
+what this plugin does on your machine, which is worth reading before you install
+any Omarchy plugin: they run unsandboxed inside your shell process.
+
 ## Colophon
 
 This plugin was co-authored with [Claude Code](https://claude.com/claude-code).

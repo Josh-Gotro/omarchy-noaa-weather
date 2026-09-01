@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tool versions
+        run: |
+          bash --version | head -1
+          jq --version
+          node --version
+
+      - name: Shell syntax
+        run: |
+          for f in weather-fetch geocode geolocate providers/noaa tests/run tests/stub-provider; do
+            bash -n "$f" || exit 1
+          done
+
+      - name: JavaScript syntax
+        run: node --check Model.js
+
+      # Mirrors the checks omarchy-plugin-validate performs, so a bad manifest
+      # fails here rather than on a user's machine. omarchy itself is not
+      # available on the runner.
+      - name: Manifest
+        run: |
+          jq -e . manifest.json > /dev/null
+          jq -e '.schemaVersion == 1' manifest.json > /dev/null
+          for field in id name version kinds entryPoints author description; do
+            jq -e --arg f "$field" 'has($f)' manifest.json > /dev/null \
+              || { echo "manifest missing $field"; exit 1; }
+          done
+          jq -e '(.kinds | type) == "array" and (.kinds | length) > 0' manifest.json > /dev/null
+          jq -e '.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")' manifest.json > /dev/null
+          jq -e '.id | startswith("omarchy.") | not' manifest.json > /dev/null
+          # every entry point must be a safe relative path that exists
+          for ep in $(jq -r '.entryPoints[]' manifest.json); do
+            case "$ep" in /*|*..*) echo "unsafe entry point: $ep"; exit 1 ;; esac
+            test -f "$ep" || { echo "missing entry point: $ep"; exit 1; }
+          done
+          # the plugin folder is cloned as-is, and the validator rejects symlinks
+          if find . -path ./.git -prune -o -type l -print | grep -q .; then
+            echo "symlinks are not allowed in a plugin folder"; exit 1
+          fi
+
+      - name: Every documented setting is declared, and vice versa
+        run: |
+          read_by_code=$(grep -oE 'setting\("[a-zA-Z]+"' BarWidget.qml | sed 's/setting("//;s/"//' | sort -u)
+          declared=$(jq -r '.barWidget.schema[].key' manifest.json | sort)
+          if [ "$read_by_code" != "$declared" ]; then
+            echo "settings read by the code and declared in the manifest differ:"
+            diff <(echo "$read_by_code") <(echo "$declared") || true
+            exit 1
+          fi
+
+      - name: Tests
+        run: ./tests/run -v

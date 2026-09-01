@@ -1,0 +1,43 @@
+name: Bug report
+description: Something the plugin does wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things solve most reports on their own, so please try them first:
+
+        - `omarchy-shell gotro.noaa-weather command` prints the exact command
+          the widget runs. Run that command yourself and see what it prints.
+        - If a location reads `outside NOAA coverage` but is in the US, check
+          your locale: `locale | grep LC_NUMERIC`.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations: {required: true}
+  - type: input
+    id: locations
+    attributes:
+      label: Your locations setting
+      description: From `omarchy bar set`, or the cog. Redact anything you would rather not share.
+      placeholder: "Austin, TX; 99801|Cabin"
+  - type: textarea
+    id: command
+    attributes:
+      label: Output of the fetch command
+      description: |
+        `omarchy-shell gotro.noaa-weather command`, then run what it prints.
+      render: shell
+  - type: input
+    id: locale
+    attributes:
+      label: Locale
+      description: Output of `locale | grep LC_NUMERIC`
+      placeholder: LC_NUMERIC="en_US.UTF-8"
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Plugin version from manifest.json, and `omarchy --version` if you have it.
