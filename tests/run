@@ -160,16 +160,33 @@ is "explicit port"            "$(allow 'https://api.weather.gov:8443/x')"     "n
 is "case-insensitive host"    "$(allow 'https://API.WEATHER.GOV/points/1,2')" "yes"
 
 echo "lib: cache safety"
+# Entries are named, never pathed; every check below exercises cache-io's
+# descriptor-bound rules through the lib.sh wrappers the scripts actually use.
 cachetest() { ( . "$ROOT/lib.sh"; CACHE_DIR="$WEATHER_CACHE_DIR"; "$@" ); }
-# writes are bounded and private
-head -c 400000 /dev/zero | tr '\0' 'a' | cachetest cache_put "$WEATHER_CACHE_DIR/bigfile"
-sz=$(stat -c %s "$WEATHER_CACHE_DIR/bigfile")
-is "cache_put caps at 256 KiB"   "$sz" "262144"
-is "cache files are private"     "$(stat -c %a "$WEATHER_CACHE_DIR/bigfile")" "600"
+cachetest cache_init && ok "cache_init adopts the test directory" \
+  || bad "cache_init adopts the test directory" "0" "$?"
+# a write comes back byte-for-byte, privately
+echo '{"ok":true}' | cachetest cache_put round.json
+is "roundtrip returns the body"  "$(cachetest cache_get round.json)" '{"ok":true}'
+is "cache files are private"     "$(stat -c %a "$WEATHER_CACHE_DIR/round.json")" "600"
+# an oversized body is refused outright, not truncated into garbage
+if head -c 400000 /dev/zero | tr '\0' 'a' | cachetest cache_put bigfile 2>/dev/null; then
+  bad "cache_put refuses an oversized body" "refusal" "wrote it"
+else
+  ok "cache_put refuses an oversized body"
+fi
+[[ -e "$WEATHER_CACHE_DIR/bigfile" ]] \
+  && bad "and leaves nothing behind" "absent" "a file" || ok "and leaves nothing behind"
+# entry names cannot carry a path
+if echo x | cachetest cache_put "../escape" 2>/dev/null; then
+  bad "cache_put refuses a path as a name" "refusal" "wrote it"
+else
+  ok "cache_put refuses a path as a name"
+fi
 # a symlinked cache entry is refused and cleared, not followed
 secret=$(mktemp); echo '{"leak":true}' > "$secret"
 ln -sf "$secret" "$WEATHER_CACHE_DIR/sneaky.json"
-if cachetest cache_get "$WEATHER_CACHE_DIR/sneaky.json" >/dev/null 2>&1; then
+if cachetest cache_get sneaky.json >/dev/null 2>&1; then
   bad "cache_get refuses a symlink" "refusal" "followed it"
 else
   ok "cache_get refuses a symlink"
@@ -177,14 +194,41 @@ fi
 [[ -e "$WEATHER_CACHE_DIR/sneaky.json" || -L "$WEATHER_CACHE_DIR/sneaky.json" ]] \
   && bad "and removes it" "gone" "still there" || ok "and removes it"
 rm -f "$secret"
+# a FIFO at an entry name is refused and cleared, without hanging the read
+mkfifo "$WEATHER_CACHE_DIR/pipe.json"
+if timeout 5 bash -c ". '$ROOT/lib.sh'; CACHE_DIR='$WEATHER_CACHE_DIR'; cache_get pipe.json" >/dev/null 2>&1; then
+  bad "cache_get refuses a FIFO" "refusal" "read it"
+else
+  ok "cache_get refuses a FIFO"
+fi
+[[ -e "$WEATHER_CACHE_DIR/pipe.json" ]] \
+  && bad "and removes the FIFO" "gone" "still there" || ok "and removes the FIFO"
 # a group/world-writable entry is refused
-echo '{"ok":true}' | cachetest cache_put "$WEATHER_CACHE_DIR/loose.json"
+echo '{"ok":true}' | cachetest cache_put loose.json
 chmod 666 "$WEATHER_CACHE_DIR/loose.json"
-if cachetest cache_get "$WEATHER_CACHE_DIR/loose.json" >/dev/null 2>&1; then
+if cachetest cache_get loose.json >/dev/null 2>&1; then
   bad "cache_get refuses loose modes" "refusal" "read it"
 else
   ok "cache_get refuses loose modes"
 fi
+# a symlink planted at the lock name blocks all cache writes
+echo '{"ok":true}' | cachetest cache_put pre-lock.json
+mv "$WEATHER_CACHE_DIR/.lock" "$WEATHER_CACHE_DIR/.lock.real" 2>/dev/null
+ln -sf /dev/null "$WEATHER_CACHE_DIR/.lock"
+if echo '{"ok":true}' | cachetest cache_put locked.json 2>/dev/null; then
+  bad "cache_put refuses a symlinked lock" "refusal" "wrote through it"
+else
+  ok "cache_put refuses a symlinked lock"
+fi
+rm -f "$WEATHER_CACHE_DIR/.lock"; mv "$WEATHER_CACHE_DIR/.lock.real" "$WEATHER_CACHE_DIR/.lock" 2>/dev/null
+# pruning drops only what is stale
+echo '{"old":true}' | cachetest cache_put stale.json
+touch -d "40 days ago" "$WEATHER_CACHE_DIR/stale.json"
+cachetest cache_prune 30
+[[ -e "$WEATHER_CACHE_DIR/stale.json" ]] \
+  && bad "prune drops a stale entry" "gone" "still there" || ok "prune drops a stale entry"
+[[ -e "$WEATHER_CACHE_DIR/round.json" ]] \
+  && ok "prune keeps a fresh entry" || bad "prune keeps a fresh entry" "kept" "gone"
 
 echo "Model.js: payload hygiene"
 if command -v node >/dev/null; then

@@ -46,7 +46,7 @@ emit_checked() {
 }
 
 key=$(printf '%s' "${query,,}" | md5sum | cut -d' ' -f1)
-cache="$CACHE_DIR/geo-$key"
+cache="geo-$key"
 if (( CACHE_OK )) && cached=$(cache_get_raw "$cache") && emit_checked "$cached"; then
   exit 0
 fi

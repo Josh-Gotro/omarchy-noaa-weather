@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Descriptor-bound cache I/O for the fetch scripts. Called by lib.sh; not an API.
+
+Why this is Python and not shell: bash can only name files by pathname, so
+every check-then-use pair (stat, then head; test, then rm) leaves a window in
+which a path component can be swapped underneath it. Everything here works on
+file descriptors instead: the cache directory is opened once with
+O_DIRECTORY|O_NOFOLLOW and verified via fstat on that descriptor, every entry
+is opened relative to it with O_NOFOLLOW and verified via fstat on the open
+descriptor, reads come from that same descriptor, and replacement is a
+descriptor-relative rename followed by fsync of both the file and the
+directory. Nothing is ever validated at one pathname and used at another, and
+nothing recursive is ever deleted.
+
+Usage (all settings via environment):
+    CACHE_IO_DIR=<dir> [CACHE_IO_MAX=<bytes>] cache-io <command> [args]
+
+Commands:
+    init                verify (creating if needed) the cache directory
+    get NAME [AGE]      print entry NAME if safe, non-empty, within the byte
+                        cap, and younger than AGE seconds (when given)
+    put NAME            stdin -> entry NAME; refuses empty or oversize bodies
+    del NAME            remove entry NAME (non-recursive), missing is fine
+    prune DAYS          remove regular entries untouched for DAYS days, and
+                        any entry that is not a regular file at all
+
+Exit status: 0 done, 1 refused/absent/unsafe, 2 usage. Always quiet: callers
+treat any failure as "no cache", never as something to report.
+"""
+
+import errno
+import fcntl
+import os
+import re
+import stat
+import sys
+import time
+
+MAX_BYTES = int(os.environ.get("CACHE_IO_MAX", "262144"))
+UID = os.geteuid()
+
+# A cache entry is a bare filename: no separators, no leading dot, so neither
+# "../x" nor ".lock" nor a hidden temp file can be named from outside.
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def refuse(code=1):
+    sys.exit(code)
+
+
+def open_cache_dir(path):
+    """Return an fd for the verified cache directory, creating it if needed.
+
+    The parent (typically ~/.cache) may legitimately be a symlink, so it is
+    resolved first and then opened O_NOFOLLOW; whatever answers must be a
+    directory owned by this user or root, and if it is world writable it must
+    carry the sticky bit (the /tmp rule, which is what stops anyone else
+    renaming our directory out from under us). The cache directory itself is
+    then opened relative to that descriptor, refusing a symlink, and must be
+    ours; loose modes are corrected on the descriptor with fchmod.
+    """
+    path = path.rstrip("/")
+    parent, leaf = os.path.split(path)
+    if not parent or not leaf or not NAME_RE.match(leaf):
+        refuse()
+    try:
+        os.makedirs(parent, exist_ok=True)
+        parent = os.path.realpath(parent, strict=True)
+        pfd = os.open(parent, O_DIR)
+    except OSError:
+        refuse()
+    try:
+        st = os.fstat(pfd)
+        if st.st_uid not in (UID, 0):
+            refuse()
+        if st.st_mode & 0o002 and not st.st_mode & 0o1000:
+            refuse()
+        try:
+            os.mkdir(leaf, 0o700, dir_fd=pfd)
+        except FileExistsError:
+            pass
+        except OSError:
+            refuse()
+        try:
+            cfd = os.open(leaf, O_DIR, dir_fd=pfd)
+        except OSError:  # ELOOP for a symlink, ENOTDIR for a file
+            refuse()
+    finally:
+        os.close(pfd)
+    st = os.fstat(cfd)
+    if st.st_uid != UID:
+        refuse()
+    if st.st_mode & 0o077:
+        os.fchmod(cfd, 0o700)
+    return cfd
+
+
+def lock(cfd):
+    """Exclusive advisory lock on .lock inside the verified directory.
+
+    Opened relative to the directory descriptor with O_NOFOLLOW and verified
+    on the open descriptor to be a regular file of ours before flock, so a
+    symlink or FIFO planted at the name is refused rather than followed.
+    Held (by the fd staying open) until the process exits.
+    """
+    try:
+        lfd = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      0o600, dir_fd=cfd)
+    except OSError:
+        refuse()
+    st = os.fstat(lfd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != UID or st.st_mode & 0o022:
+        refuse()
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lfd
+        except OSError:
+            if time.monotonic() >= deadline:
+                refuse()
+            time.sleep(0.1)
+
+
+def remove(cfd, name):
+    """Non-recursive removal of one entry, whatever it turned out to be."""
+    try:
+        os.unlink(name, dir_fd=cfd)
+    except IsADirectoryError:
+        try:
+            os.rmdir(name, dir_fd=cfd)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def cmd_get(cfd, name, max_age):
+    # O_NONBLOCK so a FIFO planted at the name cannot park us waiting for a
+    # writer; it is inert once the descriptor is confirmed to be a regular file.
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=cfd)
+    except OSError as e:
+        if e.errno == errno.ELOOP:  # a symlink is unsafe, not merely absent
+            remove(cfd, name)
+        refuse()
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != UID
+                or st.st_mode & 0o022 or st.st_size > MAX_BYTES):
+            remove(cfd, name)
+            refuse()
+        if st.st_size == 0:
+            refuse()
+        if max_age is not None and time.time() - st.st_mtime >= max_age:
+            refuse()
+        body = f.read(MAX_BYTES + 1)
+    if not body or len(body) > MAX_BYTES:
+        refuse()
+    sys.stdout.buffer.write(body)
+
+
+def cmd_put(cfd, name):
+    body = sys.stdin.buffer.read(MAX_BYTES + 1)
+    if not body or len(body) > MAX_BYTES:
+        refuse()
+    lock(cfd)
+    tmp = ".tmp.%s.%d.%x" % (name, os.getpid(), int.from_bytes(os.urandom(4), "big"))
+    try:
+        tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      0o600, dir_fd=cfd)
+    except OSError:
+        refuse()
+    try:
+        with os.fdopen(tfd, "wb") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(tfd)
+        os.rename(tmp, name, src_dir_fd=cfd, dst_dir_fd=cfd)
+        os.fsync(cfd)
+    except OSError:
+        remove(cfd, tmp)
+        refuse()
+
+
+def cmd_prune(cfd, days):
+    lock(cfd)
+    cutoff = time.time() - days * 86400
+    for name in os.listdir(cfd):
+        if name == ".lock":
+            continue
+        try:
+            st = os.stat(name, dir_fd=cfd, follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime < cutoff:
+            remove(cfd, name)
+    try:
+        os.fsync(cfd)
+    except OSError:
+        pass
+
+
+def main(argv):
+    cache_dir = os.environ.get("CACHE_IO_DIR", "")
+    if not cache_dir or len(argv) < 1:
+        refuse(2)
+    cmd, args = argv[0], argv[1:]
+
+    if cmd == "init" and not args:
+        os.close(open_cache_dir(cache_dir))
+        return
+    if cmd in ("get", "put", "del") and args and NAME_RE.match(args[0]):
+        cfd = open_cache_dir(cache_dir)
+        if cmd == "put" and len(args) == 1:
+            return cmd_put(cfd, args[0])
+        if cmd == "del" and len(args) == 1:
+            return remove(cfd, args[0])
+        if cmd == "get" and len(args) <= 2:
+            age = None
+            if len(args) == 2:
+                try:
+                    age = float(args[1])
+                except ValueError:
+                    refuse(2)
+            return cmd_get(cfd, args[0], age)
+    if cmd == "prune" and len(args) == 1:
+        try:
+            days = float(args[0])
+        except ValueError:
+            refuse(2)
+        return cmd_prune(open_cache_dir(cache_dir), days)
+    refuse(2)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except BrokenPipeError:
+        refuse()

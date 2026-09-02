@@ -73,7 +73,9 @@ omarchy plugin enable gotro.noaa-weather center
 omarchy restart shell
 ```
 
-**Requires** `curl` and `jq`, both of which Omarchy already ships.
+**Requires** `curl`, `jq`, and `python3`, all of which Omarchy already ships.
+Python is used for exactly one thing — descriptor-bound cache I/O (`cache-io`)
+— and without it the plugin still works, just uncached.
 
 ## Uninstall
 
@@ -340,6 +342,8 @@ omarchy-shell gotro.noaa-weather command     # print the exact command it runs
 | `geocode` | ZIP / city / `lat,lon` → coordinates, cached |
 | `geolocate` | IP → coordinates, only when nothing is configured |
 | `providers/noaa` | NOAA-specific fetching |
+| `lib.sh` | The network and cache rules every fetch script goes through |
+| `cache-io` | Descriptor-bound cache reads, writes, locking, pruning |
 | `weather.jq` | NOAA JSON → one normalised page |
 
 ### Caching
@@ -378,15 +382,23 @@ Rules the fetch scripts hold themselves to, all implemented in `lib.sh`:
   the forecast URL to call next) can point a request at loopback, a private
   address, or any other origin.
 - **Every download is capped at 256 KiB while it happens** (`curl
-  --max-filesize`, which aborts mid-transfer), and every cache read is capped
-  the same way. The widget applies the same cap to the process output, and
-  each field of the payload is length-limited on top of that.
-- **The cache is treated as hostile until proven otherwise**: the directory
-  must be a real directory owned by you with mode `0700` under a verified
-  parent, entries must be regular files owned by you with sane modes (no
-  symlinks), writes go through an exclusive `0600` temp file in the same
-  directory and an atomic rename under an advisory lock, and anything that
-  fails a check is discarded, not read.
+  --max-filesize`, which aborts mid-transfer), and every cache read is a
+  bounded read from an already-verified descriptor. Redirect targets come
+  from curl's own `%{redirect_url}` write-out, so no response-header file —
+  the one sink `--max-filesize` does not bound — is ever written. The widget
+  applies the same cap to the process output, and each field of the payload
+  is length-limited on top of that.
+- **The cache is treated as hostile until proven otherwise, and never
+  touched through a pathname twice**: all cache I/O runs in `cache-io`,
+  which opens the cache directory once with `O_DIRECTORY|O_NOFOLLOW` under a
+  verified parent and verifies it by `fstat` on that descriptor, opens every
+  entry relative to it with `O_NOFOLLOW` and verifies the *open descriptor*
+  (regular file, owned by you, no loose modes, within the byte cap) before
+  reading from that same descriptor, and writes through an exclusive `0600`
+  temp file, a descriptor-relative rename, and an `fsync` of both file and
+  directory, under an `flock` taken on a descriptor-verified lock file.
+  Anything that fails a check is removed without recursion, not read, and
+  nothing is ever validated at one pathname and used at another.
 - **One hard deadline per refresh**, not just per-request timeouts: the
   widget launches `weather-fetch` under `timeout`, which runs it in its own
   process group and signals the whole group, and `weather-fetch` gives each
@@ -493,6 +505,12 @@ so the order never shuffles between polls.
   truncates the target first, so an interrupted run leaves a half-written file
   that poisons every read until its TTL expires. Reads also re-parse the file
   and discard it if it no longer parses.
+- **A pathname checked is not a pathname used.** `test -f x && head x` names
+  the file twice, and anything between the two can swap a component — which is
+  why shell cannot actually keep a no-follow promise. The cache went from
+  bash check-then-use to a small Python helper (`cache-io`) that holds the
+  verified directory as a file descriptor and does every open, check, read,
+  rename, and delete relative to it.
 - **Per-request timeouts do not bound a run.** Several locations times several
   requests times the timeout is minutes of a process the bar cannot cancel, so
   there is an overall budget after which the rest are skipped with a reason.
@@ -519,9 +537,9 @@ so the order never shuffles between polls.
   chunked responses with no Content-Length (verified: exit 63 at exactly the
   cap). The size of what landed is still checked afterwards for older curls.
 - **A byte cap after buffering is not a byte cap.** Downloads are limited
-  while downloading, cache reads while reading (`head -c`), and the
-  assembled output is measured before it is printed, with a small error
-  contract emitted instead when it is oversized.
+  while downloading, cache reads are bounded reads from the verified
+  descriptor, and the assembled output is measured before it is printed,
+  with a small error contract emitted instead when it is oversized.
 - **Qt's default `Text` format is `AutoText`**, which sniffs tag-shaped
   strings as rich text. Every dynamic `Text` here sets `Text.PlainText`, and
   strings that pass through shared components this plugin does not own (the
@@ -531,7 +549,7 @@ so the order never shuffles between polls.
 ## Tests
 
 ```bash
-./tests/run        # 30 assertions, no network
+./tests/run        # 78 assertions, no network
 ./tests/run -v     # show each one
 ```
 

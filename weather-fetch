@@ -54,7 +54,7 @@ if cache_init; then
   # Cache entries are per-location and never expire on their own, so a machine
   # that has looked up many places accumulates files forever. Drop anything
   # untouched for a month; a live location rewrites its entries every poll.
-  with_cache_lock find "$CACHE_DIR" -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null
+  cache_prune 30
 fi
 
 emit_setup() {   # a valid contract that explains itself, never a bare failure

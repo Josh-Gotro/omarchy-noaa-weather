@@ -24,12 +24,16 @@ jobs:
           bash --version | head -1
           jq --version
           node --version
+          python3 --version
 
       - name: Shell syntax
         run: |
           for f in weather-fetch lib.sh geocode geolocate providers/noaa tests/run tests/stub-provider; do
             bash -n "$f" || exit 1
           done
+
+      - name: Python syntax
+        run: python3 -m py_compile cache-io
 
       # weather-fetch resolves providers from a fixed allowlist of names, one
       # of which (test-stub) may only ever exist while ./tests/run is running.

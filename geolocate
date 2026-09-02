@@ -20,7 +20,7 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 CACHE_OK=1
 cache_init || CACHE_OK=0
-cache="$CACHE_DIR/geolocate"
+cache="geolocate"
 
 emit_checked() {
   local line lat lon label

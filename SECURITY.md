@@ -38,10 +38,17 @@ It needs no credentials, stores none, and reads nothing else of yours.
   same gate before they are fetched.
 * Downloads and cache reads are capped at 256 KiB while they happen, not
   after buffering; payload fields are length-capped and control-stripped on
-  top, and rendered with `Text.PlainText`.
-* The cache directory and every entry in it are verified (regular file,
-  owned by the user, no loose modes, no symlinks) before use; writes are
-  exclusive-create temp files renamed in place under an advisory lock.
+  top, and rendered with `Text.PlainText`. Redirect targets come from curl's
+  `%{redirect_url}` write-out, so no unbounded response-header file exists.
+* All cache I/O is descriptor-bound (`cache-io`): the directory is opened
+  `O_DIRECTORY|O_NOFOLLOW` under a verified parent and checked by `fstat` on
+  that descriptor; entries are opened relative to it with `O_NOFOLLOW` and
+  verified — regular file, owned by the user, no loose modes — on the open
+  descriptor, which is also what gets read. Writes are exclusive-create
+  `0600` temp files, descriptor-relative rename, and file + directory
+  `fsync`, under an `flock` taken on a descriptor-verified lock file.
+  Unsafe entries are removed non-recursively, never read; no pathname is
+  checked at one moment and used at another.
 * Each refresh runs under one hard `timeout` deadline that signals the whole
   process group, so a hung request cannot outlive its run.
 * Which provider executables may run is a fixed allowlist in `weather-fetch`,

@@ -85,7 +85,7 @@ ck_put() { if (( CACHE_OK )); then cache_put "$@"; else cat >/dev/null; fi; }
 # /points is a stable lat,lon -> grid mapping. NOAA asks that it be cached
 # rather than re-fetched on every poll, so it is, for a week.
 pkey=$(printf '%s,%s' "$lat" "$lon" | md5sum | cut -d' ' -f1)
-pcache="$CACHE_DIR/points-$pkey.json"
+pcache="points-$pkey.json"
 points=""
 if points=$(ck_get "$pcache" 604800) && jq -e '.properties.forecast' <<<"$points" >/dev/null 2>&1; then
   :
@@ -125,7 +125,7 @@ label="${alias_label:-${noaa_label:-$fallback_label}}"
 # a refetch of every location) from tripping NOAA's rate limiter.
 FORECAST_TTL="${WEATHER_FORECAST_TTL:-300}"
 fkey=$(printf '%s' "$forecast_url" | md5sum | cut -d' ' -f1)
-fcache="$CACHE_DIR/forecast-$fkey.json"
+fcache="forecast-$fkey.json"
 if ! forecast=$(ck_get "$fcache" "$FORECAST_TTL"); then
   if forecast=$(fetch_api "$forecast_url"); then
     printf '%s' "$forecast" | ck_put "$fcache"
@@ -142,11 +142,11 @@ fi
 current='null'
 if [[ -n $stations_url ]]; then
   skey=$(printf '%s' "$stations_url" | md5sum | cut -d' ' -f1)
-  scache="$CACHE_DIR/stations-$skey.json"
+  scache="stations-$skey.json"
   stations=$(ck_get "$scache") \
     || { stations=$(fetch_api "$stations_url") && printf '%s' "$stations" | ck_put "$scache"; } \
     || stations=""
-  ocache="$CACHE_DIR/obs-$skey.json"
+  ocache="obs-$skey.json"
   if obs_cached=$(ck_get "$ocache" "$FORECAST_TTL"); then
     current="$obs_cached"
   elif [[ -n $stations ]]; then
